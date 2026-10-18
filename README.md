@@ -1,4 +1,4 @@
-# 📺 央视频全频道直播 v9.4 旗舰版
+# 📺 央视频全频道直播 v9.5 VPS 优化版
 
 ## 📢 首发地址
 - **社区**：[Gary's Club](https://t.me/garysclub)
@@ -6,93 +6,83 @@
 > ⚠️ **其他任何分发渠道均非作者本人！**
 
 ---
+## ✨ v9.5 核心特性
 
-## ✨ 核心亮点
-1. 独家双引擎四层全自动兜底机制，多重故障平滑回退不断流
-2. 真 4K 超高清，内置全部 64 路独立频道（央视 30 路 + 卫视 34 路）
-3. 原生 7 天时移回看，完美适配 TiviMate / APTV 等主流播放器
-4. SWR 毫秒秒开 + 边缘防抖 + 换台防抖，彻底消除黑屏转圈
-5. 全链路统一 8767 单端口，多协议内部静默协同、按需调度
-6. 开箱即用 Docker 镜像，内置数据持久化与 400 故障自动愈合
-
----
-
-## 🛠 核心更新与修复
-1. **（优化）取消启动强制预热**：全频道纯按需解析，彻底杜绝开机并发拉取 3 路 4K 触发平台频控、CDN 403 限流与设备被封
-2. **（新增）400 自动换身份自愈**：遇到设备风控（HTTP 400）自动废弃旧设备身份、重新生成新设备并重试，内置熔断保护（5分钟仅换一次、每日最多5次）
-3. **（新增）换台防抖**：4K 频道直接秒出 4K 超高清；普通频道切台先秒出 1080p，停留超 10 秒自动无缝升级高码率，播放器无需重开
-4. **（优化）单设备并发池**：26 路高码率频道共用 1 台设备，并发上限 6 路，空闲超 30 秒自动释放配额
-5. **（优化）设备注册失败快速降级 1080p**，不再长时间阻塞；剧场频道备用通道提速
-6. **（新增）网络分流与小火箭一键直连模块**：解决开启翻墙工具时因切片走代理导致的 403 播放失败
+1. **双引擎四层全自动兜底** — 设备协议/JCE/bkliveinfo/备用通道逐级回退，不断流
+2. **64 路独立频道** — 央视 30 路 + 卫视 34 路，全部走独立设备
+3. **7 天时移回看** — 原生支持，完美适配 TiviMate / APTV
+4. **VPS 优化** — `--no-4k` 跳过 4K 设备协议，仅走 1080p JCE，适合海外低带宽场景
+5. **HMAC 代理安全** — 防 SSRF 攻击，proxy token 签名验证
+6. **引擎就绪检测** — `/health` 返回 `engine_ready`，可控启动依赖
+7. **控制面/媒体面分离** — `control_plane` 模式，稳定可靠
 
 ---
+## 🛠 VPS 优化参数
 
-## 💻 电脑版使用方法（PC / Mac / Linux）
-1. 下载地址：https://garysclub.sharewithyou.dpdns.org/ysp-live/ysp-live-v9.4.zip
-2. Node.js 安装（非强制，建议安装，开启四层兜底）：官网下载 https://nodejs.org/zh-cn
-3. 解压进入目录直接运行：
-   ```bash
-   python3 ysp-live-v9.4.py
-   ```
-   （可选）后台常驻运行：
-   ```bash
-   nohup python3 ysp-live-v9.4.py > ysp.log 2>&1 &
-   ```
-4. 播放器添加订阅地址：`http://localhost:8767/all.m3u`
+| 参数 | 值 | 说明 |
+|------|-----|------|
+| `WINDOW` | 1800 | 时移窗口（秒） |
+| `MAX_SEGS` | 400 | 最大缓冲区片段数 |
+| `init_segs` | 400 | 初始缓冲片段数 |
+| `--no-4k` | — | 跳过 4K 设备协议注册 |
 
 ---
+## ⚡ 一键部署
 
-## ⚡ 一键部署（推荐）
 ```bash
-curl -sSL https://raw.githubusercontent.com/sure155/ysptp-docker-v9.4/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/sure155/ysptp-docker-v9.5/main/install.sh | bash
 ```
+
 > 自动拉取代码、清理旧容器、构建镜像、启动服务。部署完成后输出订阅地址。
 
-## 🐳 Docker 版使用与升级方法
-1. 下载地址：https://garysclub.sharewithyou.dpdns.org/ysp-live/ysp-live-docker-v9.4.zip
-2. 解压后进入目录，一行命令直接全新构建并启动：
-   ```bash
-   docker compose build --no-cache
-   docker compose up -d
-   ```
-3. 播放器添加订阅地址：
-   - 电脑本机播放：`http://localhost:8767/all.m3u`
-   - 局域网播放：`http://你的局域网IP:8767/all.m3u`
+## 🐳 Docker 版手动部署
 
-> 💡 **小贴士**：  
-> NAS 权限说明——群晖 / 威联通 / 软路由等 NAS 用户，如日志提示持久化目录写入受限，请在解压目录下执行 `chmod -R 777 ./data` 赋予持久化权限。
+```bash
+git clone https://github.com/sure155/ysptp-docker-v9.5.git /opt/ysp-live-v9.5
+cd /opt/ysp-live-v9.5
+docker compose build --no-cache
+docker compose up -d
+```
+
+播放器订阅地址：`http://<IP>:8767/all.m3u`
 
 ---
+## 📱 订阅信息
 
-## 📱 APTV 使用方法
-1. 点击 “配置” ➔ “服务” ➔ “添加服务”
-2. 服务名称：`央视频直播`
-3. 服务类型：`Python`
-4. 代码来源选择 “远程链接”，地址填写：`https://garysclub.sharewithyou.dpdns.org/ysp-live/ysp-live-v9.4.py`
-5. 点击 “加载代码” ➔ 划到底部点击 “添加服务” ➔ 打开服务开关
-6. 前往 APTV “添加订阅”，地址填写：`http://127.0.0.1:8767/all.m3u`
-
----
-
-## 🚀 翻墙/代理工具分流配置
-1. **小火箭（Shadowrocket）分流规则**：  
-   打开小火箭，点击底部 「配置」 -> 「模块」。  
-   点击右上角 「+」，粘贴模块链接： `https://garysclub.sharewithyou.dpdns.org/ysp-live/ysp.module`
-2. **通用规则集（Surge / Loon / Clash 等）**：  
-   规则集地址：`https://garysclub.sharewithyou.dpdns.org/ysp-live/ysp.list`
+| 用途 | 地址 |
+|------|------|
+| M3U 订阅 | `http://<IP>:8767/all.m3u` |
+| EPG 节目单 | `http://<IP>:8767/epg.xml` |
+| 健康检查 | `http://<IP>:8767/health` |
+| 诊断报告 | `http://<IP>:8767/diag` |
 
 ---
+## 🚀 常用命令
 
+```bash
+# 启动/更新
+cd /opt/ysp-live-v9.5 && docker compose up -d --build
+
+# 查看日志
+docker logs -f ysp-live-v9.5
+
+# 重启
+docker compose restart
+
+# 卸载
+docker compose down -v && cd /opt && rm -rf ysp-live-v9.5
+```
+
+---
 ## ⚠️ 友情提醒
-1. **流量消耗**：观看真 4K 视频流量约 15GB/小时，1080p 约 5GB/小时。
-2. **网络要求**：建议在家庭宽带直连运行。
-3. **状态诊断报告**（NAS 或远程设备请将 localhost 替换为对应 IP）：
-   - 健康检查：`http://localhost:8767/health`
-   - 诊断日志：`http://localhost:8767/diag`
+
+1. **流量消耗**：1080p 约 5GB/小时，请留意带宽
+2. **网络要求**：建议在稳定的网络环境下运行
+3. **翻墙分流**：如遇播放问题，需将 `*.cctv.cn` 直连，参考 `ysp.list` 分流规则
 
 ---
+## 🙏 致谢
 
-## 🙏 特别感谢
-1. 感谢 **IPTV 直播源总部** 分享的算法源码 
-2. 感谢 **Gary's Club** 群里小伙伴 **ll** 提供大量频道的 live_id 
+1. 感谢 **IPTV 直播源总部** 分享的算法源码
+2. 感谢 **Gary's Club** 群里小伙伴 **ll** 提供大量频道的 live_id
 3. 感谢 **APTV 群主** 提供的技术帮助
