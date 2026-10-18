@@ -13,6 +13,7 @@ import hmac as _hmac
 import http .client 
 import http .cookiejar 
 from http .server import BaseHTTPRequestHandler ,ThreadingHTTPServer 
+import functools
 import json 
 import math 
 import os 
