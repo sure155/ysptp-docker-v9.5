@@ -1,25 +1,29 @@
 // ============================================================
-// ysp-live IPTV 直播网关 (Cloudflare Worker, 单文件)  v10.5.1 通用优化版
+// ysp-live IPTV 直播网关 (Cloudflare Worker, 单文件)  v11.5.0
+// 基于实测流畅的 v11.3 架构精简优化 (原生 BK 直通 + 60s 后台同源热续期)
 // ============================================================
 // 环境变量 (均可选):
 //   TOKEN        访问口令, 设置后所有路径(除 / 和 favicon)都需 ?token=xxx
-//   LIVE_MODE    auto(默认) | jce | bk
-//                auto: 先 JCE 时移合成直播, 失败后自动切 bk 并"粘住" 10 分钟, 避免来回切换导致卡顿
+//   LIVE_MODE    auto(默认) | bk | jce
+//                auto: 默认走 bk 原生直播流直通 (除 CCTV-8K 外), 仅当冷启动 bk 不可用时才用 JCE 兜底
+//                bk  : 所有频道只走 bk
+//                jce : 所有频道(除 FORCE_BK 外)走 JCE
+//   PROXY_TS     设为 1 时默认通过 Worker 代理 .ts 分片 (也可在订阅/频道 URL 加 ?proxy=1)
 //   NATIVE_GZIP  设为 1 时 JCE 请求使用 CompressionStream 压缩 (默认用 stored-gzip)
 //   GUID         32 位 hex, 固定设备 ID (不设则每个 isolate 随机生成)
 //   CATCHUP_TZ   回看时间字符串(yyyyMMddHHmmss)所用时区, 默认 +08:00
 //                可填 +08:00 / utc / IANA 名(如 Asia/Shanghai) / auto(取访问者 IP 时区)
-//                只影响 playseek=yyyyMMddHHmmss 这类"本地时间"格式; utc={utc} 这类时间戳不受影响
 //   CATCHUP_MAX  单次回看最长跨度(秒), 默认 14400 (4 小时), 范围 600~43200
+//   PDT_OVERLAP_MAX  容许相邻分片 PDT 重叠的最大秒数, 默认 1.2, 范围 0.05~3
 //
-// 订阅:
-//   /all.m3u                 通用 (回看用 playseek=本地时间, 适合 TVBox/影视仓/APTV 等)
-//   /all.m3u?mode=utc        回看用 utc={utc}&lutc={lutc} (ynoTV / Kodi / TiviMate)
-//   /all.m3u?tz=-08:00       playseek 模式下声明播放器格式化时间用的时区
-//   /epg.xml  /epg.xml.gz    节目单 (多源回退, 流式转换, 缓存 1 小时)
-// 排障:
-//   /last                    最近的回看/带参数请求 (token 已打码) 及网关解析出的时间
-//   /cctv1.m3u8?debug=1      直播两条通路 + 回看自检 (含分片可达性)
+// v11.5.0 说明 (回归 v11.3 流畅直通架构, 仅做 4 项轻量级防断连修正):
+//   1. 回归 v11.3 的 bk 原生 m3u8 直通 (absolutize), 移除 v12 中会导致播放器卡住的列表重写与 JCE 主通路切换
+//   2. 解决 bk Token 过期断流: bkliveinfo 签发的 atime=120 Token 约 2 分钟过期 (v11.3 缓存 4 分钟过长, v11.4 锁死旧 URL
+//      导致过期 403); 现改为满 60 秒后台静默预刷新地址池、满 85 秒强制换用新 Token 地址, 始终在过期前平滑交接
+//   3. 同域名优先选源: 地址池刷新换用新 Token 时, 优先挑选与上一轮相同 CDN 域名 (lastHost) 的新地址,
+//      既拿到全新 Token 又保持落点在同一台上游打包服务器上, 保证 MEDIA-SEQUENCE 连续不跳变
+//   4. 禁止播放中途切 JCE + 2.5 秒快速切备用源: 播放中途遇瞬时网络抖动用旧列表兜底并在下一轮重试 bk,
+//      绝不在中途切到 JCE 造成断流; 单次 m3u8 拉取超时设为 2.5 秒以便在单次轮询内快速切到备用地址
 // ============================================================
 
 // ---------------- channels ----------------
@@ -98,6 +102,7 @@ const TVG_IDS = { "cctv1": "CCTV1", "cctv2": "CCTV2", "cctv3": "CCTV3", "cctv4":
 
 const TIMESHIFT_SUPPORTED = new Set(["ahws", "bjws", "cctv1", "cctv10", "cctv13", "cctv2", "cctv3", "cctv4", "cctv5", "cctv5p", "cctv6", "cctv7", "cctv8", "cctv8k", "cctv9", "cetv1", "cgtn", "cgtnar", "cgtndoc", "cgtnes", "cgtnfr", "cgtnru", "cqws", "dfws", "dnws", "gdws", "gsws", "guoxue", "gxws", "gzws", "hainanws", "hbws", "hebws", "henanws", "hljws", "hnws", "jlws", "jsws", "jxws", "lnws", "nmgws", "nxws", "qhws", "saxws", "scws", "sdws", "shanxiws", "szws", "tjws", "xizangws", "xjws", "ynws", "zjws"]);
 const FORCE_BK = new Set(["cctv11", "cctv12", "cctv14", "cctv15", "cctv16", "cctv164k", "cctv17", "cctv4k", "cctvdyjc", "cctvfyjc", "cctvhjjc"]);
+const FORCE_JCE = new Set(["cctv8k"]);
 const TRUE_4K = new Set(["cctv164k", "cctv4k", "cctv8k"]);
 
 // ---------------- JCE / cKey (协议层) ----------------
@@ -126,10 +131,9 @@ const concat = (...parts) => {
   return out;
 };
 
-// Workers 不允许在全局作用域生成随机数, 所以在首个请求里惰性初始化。
 let GUID = "";
 let MID = null;
-let REQ_SEQ = 0;              // 并发请求 reqid 去重 (分段回看会同时发多个 JACC 请求)
+let REQ_SEQ = 0;
 function initGuid(seed) {
   if (GUID) return;
   GUID = /^[0-9a-f]{32}$/i.test(seed || "") ? seed.toLowerCase() : hex(rnd(16));
@@ -396,7 +400,7 @@ async function unwrap(data) {
   return rc.get(1) || new Uint8Array(0);
 }
 
-// 向 JACC 申请时移 m3u8 地址 (直播合成 / 回看 都用它)
+// 向 JACC 申请时移 m3u8 地址 (回看 / CCTV-8K 使用)
 async function jceTimeshiftUrl(pid, sid, start, end, stream = "fhd", timeout = 6000) {
   const w = new W();
   w.string(pid, 0);
@@ -413,7 +417,12 @@ async function jceTimeshiftUrl(pid, sid, start, end, stream = "fhd", timeout = 6
     headers: { "Content-Type": "application/octet-stream" },
     signal: AbortSignal.timeout(timeout),
   });
-  if (!resp.ok) throw new Error("jacc HTTP " + resp.status);
+  if (!resp.ok) {
+    const e = new Error("jacc HTTP " + resp.status);
+    e.status = resp.status;
+    e.retryAfter = resp.headers.get("Retry-After");
+    throw e;
+  }
   const raw = new Uint8Array(await resp.arrayBuffer());
   const body = await unwrap(raw);
   if (!body || !body.length) throw new Error("bad response");
@@ -578,10 +587,16 @@ async function bkPlayUrls(channelId, livePid, defn = "fhd") {
   });
 
   const r = await fetch("https://bkliveinfo.ysp.cctv.cn/?" + q, {
+    cf: { cacheTtl: 0 },
     headers: { "User-Agent": "qqlive", Accept: "application/json" },
     signal: AbortSignal.timeout(4000),
   });
-  if (!r.ok) throw new Error("bkliveinfo HTTP " + r.status);
+  if (!r.ok) {
+    const e = new Error("bkliveinfo HTTP " + r.status);
+    e.status = r.status;
+    e.retryAfter = r.headers.get("Retry-After");
+    throw e;
+  }
   const p = await r.json();
   if (Number(p.iretcode ?? -1) !== 0) throw new Error(`iretcode=${p.iretcode} ${p.errinfo || ""}`);
   let urls = [];
@@ -591,42 +606,62 @@ async function bkPlayUrls(channelId, livePid, defn = "fhd") {
   else if (typeof bu === "string") urls.push(...bu.split(/[;,]/).filter((x) => x.trim()));
   urls = [...new Set(urls)].filter((u) => u && u.includes(".cctv."));
   if (!urls.length) throw new Error("no playurl");
-  urls.sort((a, b) => (a.includes("bklive-") ? 0 : 1) - (b.includes("bklive-") ? 0 : 1) || (a < b ? -1 : a > b ? 1 : 0));
+  // 按去掉动态查询参数后的 (bklive优先 + 域名路径) 确定性排序, 保证多实例选出同一主 CDN 域名
+  const baseKey = (u) => String(u).split("?")[0].replace(/^https?:\/\//i, "");
+  urls.sort((a, b) => (a.includes("bklive-") ? 0 : 1) - (b.includes("bklive-") ? 0 : 1) || baseKey(a).localeCompare(baseKey(b)));
   return urls;
 }
 
 // ---------------- 网关主体 ----------------
-const VERSION = "10.5.1-universal";
+const VERSION = "11.5.0-cf-opt";
 const UA_BROWSER = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
 const H_JCE = { "User-Agent": UA_BROWSER, Accept: "*/*" };
 const H_BK = { "User-Agent": "qqlive", Referer: "https://live.cctv.cn/", Accept: "application/vnd.apple.mpegurl,application/json,*/*" };
 const LOGO_BASE = "https://garysclub.sharewithyou.dpdns.org/logos/ysp-live-logos";
 
-const JCE_WINDOW = 90;        // 向 JACC 申请的时移窗口(秒)
-const KEEP_SEGS = 10;         // 直播列表保留的片段数
-const PLAYLIST_TTL = 2000;    // 同频道播放列表缓存(ms)
-const STALE_TTL = 30000;      // 上游故障时, 允许回放旧列表的最长时间(ms)
-const BK_URL_TTL = 90000;     // bkliveinfo 播放地址缓存(ms); 带鉴权, 不宜太久
-const STICKY_MS = 600000;     // JCE 失败转 bk 后, 多久内不再回切(ms)
-const FETCH_TIMEOUT = 6000;   // 直播: 单次上游请求超时(ms)
+// ---- 直播参数 ----
+const LIVE_BACK = 120;
+const LIVE_AHEAD = 900;
+const ANCHOR_BUCKET = 180;
+const ANCHOR_MARGIN = 60;
+const JACC_GAP_MS = 600;
+const JACC_QUEUE_MAX = 10000;
+const JACC_TIMEOUT = 7000;
+const MEDIA_TIMEOUT = 7000;
+const THROTTLE_MIN = 45;
+const THROTTLE_MAX = 600;
+const BK_GAP_MS = 250;           // bkliveinfo 接口请求最小间隔 (+ 0~150ms 抖动)
+const BK_JITTER_MS = 150;
+const BK_PREFETCH_MS = 60000;    // bk 地址池满 60 秒即在后台静默预刷新新 Token (早于 atime=120s 过期)
+const BK_URL_TTL = 85000;        // bk 地址池硬有效期 85 秒 (确保始终使用未过期的新 Token 地址)
+const BK_TIMEOUT = 2500;         // bk 单次拉取 m3u8 超时 2.5 秒 (超时立即切池内备用地址)
+const STICKY_MS = 600000;
+const FRESH_MAX = 6;
+const REFRESH_AFTER = 1.2;       // 列表超过 1.2 秒即同步刷新拉取新分片
+const SYNC_WAIT_MS = 3800;       // 已有旧缓存时, 同步等待新列表的最长时间 (ms)
+const LOW_PLAYLIST_MAX_AGE = 35; // 上游瞬时抖动时旧列表最大兜底秒数(防止偶发超时直接报 503 断连)
+const LOW_IDLE = 45;
+const COLD_WAIT_MS = 10000;
+const P_MAX = 12000;
+const CU_PEND_MAX = 60000;
+const FETCH_TIMEOUT = 6000;
 
 // ---- 回看专用参数 ----
-const CU_JACC_TIMEOUT = 8000;   // 回看: 向 JACC 申请地址的超时(ms)
-const CU_FETCH_TIMEOUT = 12000; // 回看: 拉取(可能上千片段的)长列表的超时(ms)
-const CU_CHUNK = 3600;          // 整段申请失败/被截断时, 分段申请的每段秒数 (1 小时, 减少拼接交界与子请求数)
-const CU_PARALLEL = 3;          // 分段并发数 (注意免费版单请求子请求上限 50)
-const CU_CACHE_TTL = 300000;    // 已播完节目的回看列表缓存(ms)
-const CU_BUDGET = 16000;        // 单次回看"换清晰度/重试"的总预算(ms)
+const CU_JACC_TIMEOUT = 8000;
+const CU_FETCH_TIMEOUT = 12000;
+const CU_CHUNK = 3600;
+const CU_PARALLEL = 3;
+const CU_CACHE_TTL = 300000;
+const CU_BUDGET = 16000;
 
 const CH = new Map(CHANNELS.map((c) => [c.slug, c]));
-const cfg = { mode: "auto", tz: 480, max: 14400 }; // 默认最长回看跨度提升至 14400 秒 (4 小时)
-const memo = new Map();       // slug -> { t, pl, mode, note, p }
-const bkUrls = new Map();     // slug -> { t, urls }
-const segState = new Map();   // slug -> Map(segKey -> seq)   (仅最后兜底用)
-const sticky = new Map();     // slug -> 截止时间戳
-const cuCache = new Map();    // "slug|start|end" -> { t, p }
-const reqLog = [];            // 最近的回看/带参数请求 (isolate 内存, 仅供诊断)
-const liveLog = [];           // 最近的纯直播请求 (每频道 20s 内只记一次)
+const cfg = { mode: "auto", tz: 480, max: 14400, origin: "", overlapMax: 1.2, proxyTs: false, token: "" };
+const LIVE = new Map();
+const gate = { next: 0, blockedUntil: 0, penalty: 0, last: null };
+const bkGate = { next: 0, blockedUntil: 0 };
+const cuCache = new Map();
+const reqLog = [];
+const liveLog = [];
 const liveSeen = new Map();
 let liveHits = 0;
 const maskQ = (q) => q.replace(/([?&]token=)[^&?]*/gi, "$1***");
@@ -637,6 +672,8 @@ const M3U8 = "application/vnd.apple.mpegurl";
 const reply = (body, status = 200, type = "text/plain; charset=utf-8", extra = {}) =>
   new Response(body, { status, headers: { "Content-Type": type, "Cache-Control": "no-cache, no-store, max-age=0", ...CORS, ...extra } });
 const errMsg = (e) => String((e && e.message) || e);
+const stripQ = (u) => String(u).split("?")[0];
+const hostOf = (u) => { try { return new URL(u).host; } catch { return "?"; } };
 
 const groupOf = (slug) => (slug.startsWith("cctv") || slug.startsWith("cgtn") ? "央视" : "卫视");
 const normalize = (raw) => {
@@ -721,8 +758,14 @@ function parseCatchup(sp, defaultTz = 480, maxSpan = 14400, autoTz = null) {
 }
 
 // ---- 上游抓取 / 播放列表工具 ----
+// 注意: Cloudflare Workers 不支持 fetch({ cache: "no-store" }), 必须用 cf: { cacheTtl: 0 } 禁用边缘子请求缓存
 async function fetchText(url, headers, timeout = FETCH_TIMEOUT) {
-  const r = await fetch(url, { headers, redirect: "follow", signal: AbortSignal.timeout(timeout) });
+  const r = await fetch(url, {
+    headers,
+    cf: { cacheTtl: 0 },
+    redirect: "follow",
+    signal: AbortSignal.timeout(timeout),
+  });
   if (!r.ok) {
     let host = "";
     try { host = " @" + new URL(url).host; } catch {}
@@ -745,9 +788,30 @@ function resolver(base) {
   };
 }
 
+// 可选分片代理重写
+function wrapProxyUrl(targetUrl, mode = "bk") {
+  const tk = cfg.token ? `&token=${encodeURIComponent(cfg.token)}` : "";
+  return `${cfg.origin}/seg?m=${mode}${tk}&u=${encodeURIComponent(targetUrl)}`;
+}
+function rewritePlaylistProxy(playlist, mode = "bk") {
+  const out = [];
+  for (const ln of playlist.split(/\r?\n/)) {
+    const s = ln.trim();
+    if (!s) { out.push(ln); continue; }
+    if (s[0] === "#") {
+      out.push(s.includes('URI="') ? ln.replace(/URI="([^"]+)"/g, (_, u) => `URI="${/^https?:\/\//i.test(u) ? wrapProxyUrl(u, mode) : u}"`) : ln);
+    } else if (/^https?:\/\//i.test(s)) {
+      out.push(wrapProxyUrl(s, mode));
+    } else {
+      out.push(ln);
+    }
+  }
+  return out.join("\n");
+}
+
 async function fetchMediaPlaylist(url, headers, depth = 0, timeout = FETCH_TIMEOUT) {
   const { text, final } = await fetchText(url, headers, timeout);
-  if (!text.includes("#EXTM3U")) throw new Error("not an m3u8 @" + (() => { try { return new URL(final).host; } catch { return "?"; } })());
+  if (!text.includes("#EXTM3U")) throw new Error("not an m3u8 @" + hostOf(final));
   if (depth < 2 && text.includes("#EXT-X-STREAM-INF")) {
     const lines = text.split(/\r?\n/);
     const i = lines.findIndex((l) => l.trim().startsWith("#EXT-X-STREAM-INF"));
@@ -786,7 +850,6 @@ function absolutize(text, base, isCatchup = false) {
   return r;
 }
 
-// ---- JCE 时移 -> 合成直播列表 ----
 function parseMedia(text, base) {
   const abs = resolver(base);
   const segs = [];
@@ -809,53 +872,6 @@ function parseMedia(text, base) {
 
 const sumDur = (segs) => segs.reduce((a, s) => a + s.dur, 0);
 
-const nominalDur = (win) => {
-  const d = win.map((s) => s.dur).filter((x) => x > 0).sort((a, b) => a - b);
-  return Math.max(1, Math.round(d.length ? d[d.length >> 1] : 6));
-};
-
-function localSeq(slug, win, nom) {
-  const k = (s) => s.url.split("?")[0];
-  const table = segState.get(slug) || new Map();
-  let seq = null;
-  for (let i = 0; i < win.length; i++) {
-    const old = table.get(k(win[i]));
-    if (old !== undefined) { seq = old - i; break; }
-  }
-  if (seq === null) {
-    const base = Math.floor(Date.now() / 1e3 / nom);
-    seq = table.size ? Math.max(base, Math.max(...table.values()) + 1) : base;
-  }
-  const next = new Map();
-  win.forEach((s, i) => next.set(k(s), seq + i));
-  segState.set(slug, next);
-  return seq;
-}
-
-function stableSeq(slug, win) {
-  const nom = nominalDur(win);
-  const nums = win.slice(0, 2).map((s) => Number((s.url.split("?")[0].match(/(\d{3,})\.[a-z0-9]+$/i) || [])[1]));
-  const step = nums.length === 2 ? nums[1] - nums[0] : NaN;
-  if (step === 1) return nums[0];
-  const t = win[0].pdt ? Date.parse(win[0].pdt) : NaN;
-  if (!Number.isNaN(t)) return Math.round(t / 1e3 / nom);
-  if (step > 1) return Math.round(nums[0] / step);
-  return localSeq(slug, win, nom);
-}
-
-function renderLive(win, seq) {
-  const target = Math.max(1, ...win.map((s) => Math.round(s.dur)));
-  const out = ["#EXTM3U", `#EXT-X-VERSION:${win.some((s) => s.map) ? 6 : 3}`, `#EXT-X-TARGETDURATION:${target}`, `#EXT-X-MEDIA-SEQUENCE:${seq}`];
-  let key = "", map = "";
-  for (const s of win) {
-    if (s.map && s.map !== map) { out.push(s.map); map = s.map; }
-    if (s.key && s.key !== key) { out.push(s.key); key = s.key; }
-    if (s.pdt) out.push("#EXT-X-PROGRAM-DATE-TIME:" + s.pdt);
-    out.push(`#EXTINF:${s.dur.toFixed(3)},`, s.url);
-  }
-  return out.join("\n") + "\n";
-}
-
 function renderVod(segs) {
   let target = 1;
   for (const s of segs) target = Math.max(target, Math.ceil(s.dur));
@@ -871,80 +887,617 @@ function renderVod(segs) {
   return out.join("\n") + "\n";
 }
 
-function buildLive(slug, text, baseUrl) {
-  const segs = parseMedia(text, baseUrl);
-  if (!segs.length) throw new Error("empty playlist");
-  const win = segs.slice(-KEEP_SEGS);
-  return renderLive(win, stableSeq(slug, win));
+// ============================================================
+// 直播引擎 —— 回归 v11.3 原生直通架构 + 60s 后台同域名 Token 热续期
+// ============================================================
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const waitFor = (p, ms) => new Promise((resolve) => {
+  const t = setTimeout(() => resolve(false), ms);
+  p.then((v) => { clearTimeout(t); resolve(v); }, () => { clearTimeout(t); resolve(false); });
+});
+
+class RateLimited extends Error {
+  constructor(msg, retrySec) { super(msg); this.name = "RateLimited"; this.retry = Math.max(1, Math.ceil(retrySec || 1)); }
+}
+class Reopen extends Error { constructor(msg, retryNow = false) { super(msg); this.name = "Reopen"; this.retryNow = retryNow; } }
+
+// ---- 跨实例共享的小记录 (Cache API, 尽力而为) ----
+const sharedReq = (name) => new Request(`${cfg.origin}/__ysp_state/${name}`);
+async function sharedGet(name) {
+  try {
+    if (typeof caches === "undefined" || !cfg.origin) return null;
+    const r = await caches.default.match(sharedReq(name));
+    return r ? await r.json() : null;
+  } catch { return null; }
+}
+async function sharedPut(name, obj, ttlSec) {
+  try {
+    if (typeof caches === "undefined" || !cfg.origin || !(ttlSec > 0)) return;
+    await caches.default.put(sharedReq(name), new Response(JSON.stringify(obj), { headers: { "Content-Type": "application/json", "Cache-Control": `public, max-age=${Math.ceil(ttlSec)}` } }));
+  } catch {}
+}
+async function sharedDel(name) {
+  try {
+    if (typeof caches === "undefined" || !cfg.origin) return;
+    await caches.default.delete(sharedReq(name));
+  } catch {}
+}
+async function sharedProbe() {
+  try {
+    if (typeof caches === "undefined" || !cfg.origin) return false;
+    const k = "probe-" + Math.random().toString(36).slice(2, 8);
+    await sharedPut(k, { ok: 1 }, 30);
+    const v = await sharedGet(k);
+    return !!(v && v.ok === 1);
+  } catch { return false; }
 }
 
-// ---- 两条直播通路 ----
-async function viaJce(ch) {
-  const now = Math.floor(Date.now() / 1e3);
-  const m3u8 = await jceTimeshiftUrl(ch.pid, ch.sid, now - JCE_WINDOW, now, ch.defn);
-  const { text, final } = await fetchMediaPlaylist(m3u8, H_JCE);
-  return buildLive(ch.slug, text, final);
+// ---- JACC 闸门 ----
+const RATE_RE = /操作过于频繁|请求过于频繁|too many requests|rate limit/i;
+const gateRemainingSec = () => Math.max(0, (gate.blockedUntil - Date.now()) / 1000);
+function parseRetryAfter(h) {
+  if (!h) return 0;
+  const n = Number(h);
+  if (Number.isFinite(n) && n >= 0) return n;
+  const t = Date.parse(h);
+  return Number.isNaN(t) ? 0 : Math.max(0, (t - Date.now()) / 1000);
+}
+async function noteThrottle(retryAfter, detail, channel) {
+  gate.penalty = Math.min(THROTTLE_MAX, Math.max(THROTTLE_MIN, gate.penalty * 2));
+  const delay = Math.max(gate.penalty, parseRetryAfter(retryAfter));
+  gate.blockedUntil = Math.max(gate.blockedUntil, Date.now() + delay * 1000);
+  gate.last = { at: new Date().toISOString(), channel: channel || null, detail: String(detail || "").replace(/\s+/g, " ").slice(0, 120), retryAfter: retryAfter || null };
+  await sharedPut("cooldown", { until: gate.blockedUntil, penalty: gate.penalty, last: gate.last }, delay + 5);
+  return new RateLimited(`JCE 请求被上游限流 (${gate.last.detail}), 暂停 ${Math.round(gateRemainingSec())} 秒`, gateRemainingSec());
+}
+async function loadSharedCooldown() {
+  if (gate.blockedUntil > Date.now()) return;
+  const c = await sharedGet("cooldown");
+  if (c && c.until > Date.now()) {
+    gate.blockedUntil = Math.max(gate.blockedUntil, c.until);
+    gate.penalty = Math.max(gate.penalty, c.penalty || 0);
+    if (c.last) gate.last = c.last;
+  }
+}
+async function jaccCall(fn, active, channel) {
+  await loadSharedCooldown();
+  if (gateRemainingSec() > 0) throw new RateLimited(`JCE 限流冷却中, 剩余 ${Math.round(gateRemainingSec())} 秒`, gateRemainingSec());
+  const now = Date.now();
+  const slot = Math.max(now, gate.next);
+  if (slot - now > JACC_QUEUE_MAX) throw new Error("JCE 请求排队过长, 请稍后重试");
+  gate.next = slot + JACC_GAP_MS;
+  if (slot > now) await sleep(slot - now);
+  if (active && !active()) throw new Error("频道已空闲, 取消排队中的请求");
+  if (gateRemainingSec() > 0) throw new RateLimited(`JCE 限流冷却中, 剩余 ${Math.round(gateRemainingSec())} 秒`, gateRemainingSec());
+  try {
+    const r = await fn();
+    gate.penalty = 0;
+    return r;
+  } catch (e) {
+    if (e && e.status === 429) throw await noteThrottle(e.retryAfter, `HTTP 429${e.retryAfter ? " Retry-After=" + e.retryAfter : ""}`, channel);
+    if (RATE_RE.test(errMsg(e))) throw await noteThrottle(null, `业务错误: ${errMsg(e)}`, channel);
+    throw e;
+  }
+}
+const jaccUrl = (ch, start, end, defn, timeout, active) =>
+  jaccCall(() => jceTimeshiftUrl(ch.pid, ch.sid, start, end, defn, timeout), active, ch.slug);
+
+async function bkSlot() {
+  if (bkGate.blockedUntil > Date.now()) throw new RateLimited("bk 通路限流冷却中", (bkGate.blockedUntil - Date.now()) / 1000);
+  const now = Date.now();
+  const slot = Math.max(now, bkGate.next);
+  if (slot - now > JACC_QUEUE_MAX) throw new Error("bk 请求排队过长, 请稍后重试");
+  bkGate.next = slot + BK_GAP_MS + Math.random() * BK_JITTER_MS;
+  if (slot > now) await sleep(slot - now);
 }
 
-async function viaBk(ch) {
+// ---- 每频道直播状态 ----
+function liveState(ch) {
+  let st = LIVE.get(ch.slug);
+  if (!st) {
+    const defaultMode = FORCE_JCE.has(ch.slug) ? "jce" : "bk";
+    st = {
+      mode: defaultMode, stickyUntil: 0,
+      anchor: null,
+      accepted: "", offset: 0,
+      rows: new Map(),
+      tail: null, target: null, suppressPdt: false, precise: null,
+      playlist: "", builtAt: 0, mediaEnd: 0, lastOk: 0, lastAccess: 0,
+      mediaBlockedUntil: 0,
+      lastError: "", lastErr: null, fails: 0, retryAt: 0,
+      inflight: null, inflightAt: 0,
+      bk: { urls: [], t: 0, lastTail: "", lastHost: "", refreshing: false },
+    };
+    LIVE.set(ch.slug, st);
+  }
+  return st;
+}
+function resetContinuity(st) {
+  st.rows = new Map(); st.tail = null; st.target = null; st.accepted = ""; st.suppressPdt = false;
+  st.playlist = ""; st.builtAt = 0; st.mediaEnd = 0; st.lastOk = 0;
+}
+async function invalidateAnchor(ch, st) {
+  st.anchor = null;
+  await sharedDel("anchor-" + ch.slug);
+}
+function effectiveMode(ch, st) {
+  if (FORCE_BK.has(ch.slug) || cfg.mode === "bk") return "bk";
+  if (FORCE_JCE.has(ch.slug)) return "jce";
+  const isIdle = Date.now() / 1000 - st.lastAccess >= LOW_IDLE;
+  if (cfg.mode === "jce") {
+    if (st.mode === "bk" && st.stickyUntil && Date.now() > st.stickyUntil && isIdle) {
+      st.mode = "jce"; st.stickyUntil = 0; resetContinuity(st);
+    }
+    return st.mode === "bk" && st.stickyUntil ? "bk" : "jce";
+  }
+  // auto 模式: 默认优先走 bk 真直播流; 若冷启动降级到了 jce, 仅在频道空闲后回切 bk
+  if (st.mode === "jce" && st.stickyUntil && Date.now() > st.stickyUntil && isIdle) {
+    st.mode = "bk"; st.stickyUntil = 0; resetContinuity(st);
+  }
+  return st.mode;
+}
+
+// ---- JCE 播放列表解析 (仅供 CCTV-8K 或显式 LIVE_MODE=jce 使用) ----
+const PDT_RE = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}(?::?\d{2})?)?$/i;
+function parsePdt(v, info) {
+  const m = PDT_RE.exec(String(v).trim());
+  if (!m) throw new Error("JCE invalid PDT");
+  const [, y, mo, d, h, mi, sec, frac, tz] = m;
+  if (info && frac) info.frac = true;
+  let off = 28800;
+  if (tz) {
+    if (tz.toUpperCase() === "Z") off = 0;
+    else {
+      const t = tz.replace(":", "");
+      off = (t[0] === "-" ? -1 : 1) * (+t.slice(1, 3) * 3600 + +(t.slice(3, 5) || 0) * 60);
+    }
+  }
+  return Date.UTC(+y, +mo - 1, +d, +h, +mi, +sec) / 1000 + (frac ? Number("0." + frac) : 0) - off;
+}
+
+function parseJceWindow(text, base, nowSec) {
+  const lines = text.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+  if (!lines.length || lines[0] !== "#EXTM3U") throw new Error("JCE invalid media playlist");
+  const abs = resolver(base);
+  let seq = 0, duration = null, stamp = null, target = null, prevEnd = null, prevStart = null, prevDur = null;
+  const pinfo = { frac: false };
+  const rows = [];
+  for (const line of lines.slice(1)) {
+    if (line.startsWith("#EXT-X-TARGETDURATION:")) {
+      target = parseInt(line.split(":")[1], 10) || 6;
+    } else if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
+      if (!rows.length) {
+        const s = parseInt(line.split(":")[1], 10);
+        if (s >= 0) seq = s;
+      }
+    } else if (line.startsWith("#EXT-X-PROGRAM-DATE-TIME:")) {
+      stamp = parsePdt(line.slice(line.indexOf(":") + 1), pinfo);
+    } else if (line.startsWith("#EXTINF:")) {
+      duration = parseFloat(line.slice(8).split(",")[0]);
+      if (!Number.isFinite(duration) || !(duration > 0 && duration <= 60)) throw new Error("JCE invalid segment duration");
+    } else if (line[0] !== "#") {
+      if (duration === null) continue;
+      if (stamp === null) stamp = prevEnd !== null ? prevEnd : nowSec - 60;
+      if (prevStart !== null && pinfo.frac && stamp <= prevStart) throw new Error("JCE non-increasing PDT");
+      if (prevStart !== null && !pinfo.frac && stamp < prevStart - 1.0) throw new Error("JCE non-increasing PDT");
+      if (prevEnd !== null) {
+        const gap = stamp - prevEnd;
+        const overlapLimit = pinfo.frac
+          ? Math.min(cfg.overlapMax, 0.25 * Math.min(prevDur, duration))
+          : Math.max(cfg.overlapMax, 1.15);
+        if (gap < -overlapLimit - 1e-7) stamp = prevEnd;
+      }
+      prevStart = stamp; prevDur = duration;
+      const u = abs(line);
+      if (!/^https?:\/\//i.test(u)) throw new Error("JCE invalid media URI");
+      rows.push([seq + rows.length, stamp, duration, u, u.split("?")[0].split("/").pop()]);
+      prevEnd = stamp + duration;
+      stamp = prevEnd; duration = null;
+    }
+  }
+  if (!rows.length) throw new Error("JCE incomplete media playlist");
+  let maxSegDur = target || 6;
+  for (const r of rows) maxSegDur = Math.max(maxSegDur, Math.ceil(r[2]));
+  target = Math.min(60, Math.max(1, maxSegDur));
+
+  let completed = rows.filter((r) => r[1] + r[2] <= nowSec + 1.5);
+  if (completed.length < 3) completed = rows.slice();
+  let cutAt = 0;
+  for (let i = 1; i < completed.length; i++) if (completed[i][1] - (completed[i - 1][1] + completed[i - 1][2]) > 30) cutAt = i;
+  completed = completed.slice(cutAt);
+  const last = completed[completed.length - 1];
+  if (completed.length < 3 || nowSec - (last[1] + last[2]) > 90) throw new Error("JCE no recent completed media");
+
+  const holdLast = completed.length > 4 && (nowSec - (last[1] + last[2]) < 1.0);
+  const picked = (holdLast ? completed.slice(0, -1) : completed).slice(-6);
+  return { rows: picked, target, precise: pinfo.frac };
+}
+
+async function resolveAnchor(ch, st) {
+  const rec = await sharedGet("anchor-" + ch.slug);
+  if (rec && rec.url && rec.expiry > Date.now() + 10000) {
+    st.anchor = { url: rec.url, expiry: rec.expiry, gen: rec.gen, offset: rec.offset, shared: true };
+    return;
+  }
+  const nowS = Math.floor(Date.now() / 1000);
+  const start = Math.floor((nowS - LIVE_BACK) / ANCHOR_BUCKET) * ANCHOR_BUCKET;
+  const end = start + ANCHOR_BUCKET + LIVE_BACK + LIVE_AHEAD;
+  const active = () => Date.now() / 1000 - st.lastAccess < LOW_IDLE;
+  const url = await jaccUrl(ch, start, end, ch.defn, JACC_TIMEOUT, active);
+  st.anchor = { url, expiry: (end - ANCHOR_MARGIN) * 1000, gen: `b-${start}`, offset: undefined, shared: false };
+}
+
+async function jceRefresh(ch, st) {
+  if (Date.now() < st.mediaBlockedUntil) throw new RateLimited("JCE media 限流冷却中", (st.mediaBlockedUntil - Date.now()) / 1000);
+  if (!st.anchor || Date.now() >= st.anchor.expiry) await resolveAnchor(ch, st);
+  const anchor = st.anchor;
+
+  let r;
+  try {
+    r = await fetch(anchor.url, {
+      headers: H_JCE,
+      cf: { cacheTtl: 0 },
+      redirect: "follow",
+      signal: AbortSignal.timeout(MEDIA_TIMEOUT),
+    });
+  } catch (e) {
+    await invalidateAnchor(ch, st);
+    throw e;
+  }
+  if (r.status === 429) {
+    const delay = Math.max(THROTTLE_MIN, parseRetryAfter(r.headers.get("Retry-After")));
+    st.mediaBlockedUntil = Date.now() + delay * 1000;
+    throw new RateLimited(`JCE media 被上游限流 (HTTP 429${r.headers.get("Retry-After") ? " Retry-After=" + r.headers.get("Retry-After") : ""})`, delay);
+  }
+  if (!r.ok) {
+    await invalidateAnchor(ch, st);
+    throw new Error(`HTTP ${r.status} @${hostOf(anchor.url)}`);
+  }
+  const text = await r.text();
+  if (text.length > 2097152) throw new Error("JCE playlist too large");
+
+  let parsed;
+  try {
+    parsed = parseJceWindow(text, r.url || anchor.url, Date.now() / 1000);
+  } catch (e) {
+    await invalidateAnchor(ch, st);
+    throw e;
+  }
+  const { rows: native, target, precise } = parsed;
+
+  const tol = precise ? 0.05 : cfg.overlapMax;
+  const same = (x, y) => (!!x[2] && x[2] === y[2]) || (Math.abs(x[0] - y[0]) <= tol && Math.abs(x[1] - y[1]) < 0.05);
+
+  let offset = st.offset;
+  if (st.accepted !== anchor.gen) {
+    if (st.rows.size) {
+      const offs = new Set();
+      for (const [sq, stamp, dur, , key] of native) {
+        for (const [oldSeq, v] of st.rows) if (same([stamp, dur, key], v)) offs.add(oldSeq - sq);
+      }
+      if (offs.size !== 1) throw new Reopen("JCE new window lacks unambiguous PDT overlap", true);
+      offset = [...offs][0];
+    } else offset = anchor.offset ?? 0;
+  }
+  const rows = native.map(([sq, t, d, u, k]) => [sq + offset, t, d, u, k]);
+  const tail = rows[rows.length - 1];
+  if (st.tail) {
+    const [pSeq, pStamp, pKey, pDur] = st.tail;
+    if (tail[0] < pSeq || tail[1] < pStamp - tol) throw new Reopen("JCE live window regressed", true);
+    if ((tail[0] === pSeq) !== same([tail[1], tail[2], tail[4]], [pStamp, pDur, pKey])) throw new Reopen("JCE media sequence/PDT mismatch", true);
+    for (const [sq, t, d, , k] of rows) {
+      const o = st.rows.get(sq);
+      if (o && !same([t, d, k], o)) throw new Reopen("JCE overlapping media changed", true);
+    }
+  }
+
+  const overlapped = rows.some((x, i) => i > 0 && x[1] < rows[i - 1][1] + rows[i - 1][2] - 1e-6);
+  const suppressPdt = st.suppressPdt || !precise || overlapped;
+  const effTarget = Math.max(st.target || 0, target);
+  const out = ["#EXTM3U", "#EXT-X-VERSION:3", `#EXT-X-TARGETDURATION:${effTarget}`, `#EXT-X-MEDIA-SEQUENCE:${rows[0][0]}`];
+  for (const [, t, d, u] of rows) {
+    if (!suppressPdt) out.push("#EXT-X-PROGRAM-DATE-TIME:" + new Date(t * 1000).toISOString());
+    out.push(`#EXTINF:${d.toFixed(6)},`, u);
+  }
+  const nowS = Date.now() / 1000;
+  const prevTailKey = st.tail ? st.tail[2] : "";
+  const advanced = tail[4] !== prevTailKey;
+
+  st.suppressPdt = suppressPdt; st.target = effTarget; st.offset = offset; st.accepted = anchor.gen;
+  st.tail = [tail[0], tail[1], tail[4], tail[2]]; st.precise = precise;
+  st.rows = new Map(rows.map((x) => [x[0], [x[1], x[2], x[4]]]));
+  st.playlist = out.join("\n") + "\n";
+  st.mediaEnd = tail[1] + tail[2];
+  st.builtAt = advanced || !prevTailKey ? nowS : Math.max(0, nowS - (REFRESH_AFTER - 0.6));
+  st.lastOk = nowS; st.lastError = ""; st.lastErr = null;
+  if (anchor.offset === undefined) anchor.offset = offset;
+  if (!anchor.shared) {
+    anchor.shared = true;
+    await sharedPut("anchor-" + ch.slug, { url: anchor.url, expiry: anchor.expiry, gen: anchor.gen, offset: anchor.offset }, (anchor.expiry - Date.now()) / 1000 - 5);
+  }
+}
+
+async function rawPlaylistReport(st) {
+  const a = st.anchor;
+  if (!a) return { error: "该频道还没有申请过 JCE 地址: 先用 LIVE_MODE=jce 请求一次该频道 (或加 &probe=1)" };
+  const r = await fetch(a.url, {
+    headers: H_JCE,
+    cf: { cacheTtl: 0 },
+    redirect: "follow",
+    signal: AbortSignal.timeout(MEDIA_TIMEOUT),
+  });
+  const text = await r.text();
+  const lines = text.split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+  const tags = {};
+  for (const l of lines) if (l[0] === "#") { const k = l.split(":")[0]; tags[k] = (tags[k] || 0) + 1; }
+  let stamp = null, dur = null, prevEnd = null, segments = 0, noPdt = 0;
+  const gaps = [], durs = new Set();
+  for (const l of lines) {
+    if (l.startsWith("#EXT-X-PROGRAM-DATE-TIME:")) { try { stamp = parsePdt(l.slice(l.indexOf(":") + 1)); } catch { stamp = null; } }
+    else if (l.startsWith("#EXTINF:")) { dur = parseFloat(l.slice(8)); durs.add(dur); }
+    else if (l[0] !== "#") {
+      segments++;
+      if (stamp === null || dur === null) noPdt++;
+      else { if (prevEnd !== null) gaps.push(+(stamp - prevEnd).toFixed(3)); prevEnd = stamp + dur; stamp = prevEnd; }
+      dur = null;
+    }
+  }
+  const sorted = [...gaps].sort((x, y) => x - y);
+  const cut = (l) => (l.length > 140 ? l.slice(0, 140) + `…(+${l.length - 140})` : l);
+  return {
+    status: r.status, bytes: text.length, host: hostOf(a.url), segments, segmentsWithoutPdt: noPdt, tags,
+    durations: [...durs].slice(0, 8),
+    gapSec: sorted.length ? { min: sorted[0], median: sorted[sorted.length >> 1], max: sorted[sorted.length - 1], overlapsOver0_15: gaps.filter((g) => g < -0.15).length, overlapsOver0_5: gaps.filter((g) => g < -0.5).length, gapsOver1: gaps.filter((g) => g > 1).length } : null,
+    lastGaps: gaps.slice(-20),
+    head: lines.slice(0, 8).map(cut), tail: lines.slice(-4).map(cut),
+  };
+}
+
+// ---- bk 通路 (v11.3 原生 m3u8 直通 + 60s 后台预刷 Token + 同域名优先锁定) ----
+async function fetchBkPool(ch, st) {
+  await bkSlot();
+  const urls = await bkPlayUrls(ch.sid, ch.pid, ch.defn);
+  // 若上一轮已有稳定播放的 CDN 域名 (lastHost), 将新池中同域名的新 Token 地址排在首位,
+  // 既换上全新 Token 避免 120s 过期断流, 又保持在同一台 CDN 服务器上使 MEDIA-SEQUENCE 连续不跳变
+  if (st.bk.lastHost) {
+    urls.sort((a, b) => (hostOf(a) === st.bk.lastHost ? 0 : 1) - (hostOf(b) === st.bk.lastHost ? 0 : 1));
+  }
+  st.bk.urls = urls;
+  st.bk.t = Date.now();
+  await sharedPut("bk-" + ch.slug, { urls, t: st.bk.t, lastHost: st.bk.lastHost }, 80);
+}
+
+async function ensureBkUrls(ch, st, ctx, forceRefresh = false) {
+  const age = Date.now() - st.bk.t;
+  if (!forceRefresh && st.bk.urls.length && age <= BK_URL_TTL) {
+    // 满 60 秒时在后台静默刷新地址池, 避免在 85 秒到期时阻塞播放器轮询
+    if (age > BK_PREFETCH_MS && !st.bk.refreshing) {
+      st.bk.refreshing = true;
+      const bg = fetchBkPool(ch, st).catch(() => {}).finally(() => { st.bk.refreshing = false; });
+      if (ctx && ctx.waitUntil) ctx.waitUntil(bg);
+    }
+    return;
+  }
+  if (!forceRefresh) {
+    const shared = await sharedGet("bk-" + ch.slug);
+    if (shared && Array.isArray(shared.urls) && shared.urls.length && Date.now() - shared.t <= BK_URL_TTL) {
+      st.bk.urls = shared.urls;
+      st.bk.t = shared.t;
+      if (!st.bk.lastHost && shared.lastHost) st.bk.lastHost = shared.lastHost;
+      return;
+    }
+  }
+  await fetchBkPool(ch, st);
+}
+
+async function bkRefresh(ch, st, ctx) {
+  await ensureBkUrls(ch, st, ctx, false);
   let last = "";
   for (let attempt = 0; attempt < 2; attempt++) {
-    const c = bkUrls.get(ch.slug);
-    const cached = attempt === 0 && c && Date.now() - c.t < BK_URL_TTL;
-    const urls = cached ? c.urls : await bkPlayUrls(ch.sid, ch.pid, ch.defn);
-    if (!cached) bkUrls.set(ch.slug, { t: Date.now(), urls });
-    try {
-      const { text, final } = await Promise.any(urls.slice(0, 3).map((u) => fetchMediaPlaylist(u, H_BK)));
-      return absolutize(text, final);
-    } catch (e) {
-      last = errMsg(e.errors ? e.errors[0] : e);
-      if (!cached) break;
+    // 若已有稳定域名, 优先尝试池中该域名的最新 Token 地址
+    const candidates = [...st.bk.urls].slice(0, 4);
+    if (st.bk.lastHost) {
+      candidates.sort((a, b) => (hostOf(a) === st.bk.lastHost ? 0 : 1) - (hostOf(b) === st.bk.lastHost ? 0 : 1));
+    }
+    for (const u of candidates) {
+      try {
+        const { text, final } = await fetchMediaPlaylist(u, H_BK, 0, BK_TIMEOUT);
+        if (!text.includes("#EXTM3U") || !text.includes("#EXTINF")) continue;
+        const nowS = Date.now() / 1000;
+        const pl = absolutize(text, final);
+        const segLines = pl.split(/\r?\n/).filter((l) => l && !l.startsWith("#"));
+        const tailSeg = segLines.length ? segLines[segLines.length - 1].split("?")[0] : "";
+        const advanced = tailSeg && tailSeg !== st.bk.lastTail;
+        st.bk.lastTail = tailSeg;
+        st.bk.lastHost = hostOf(u);
+        st.playlist = pl;
+        st.builtAt = advanced || !st.builtAt ? nowS : Math.max(0, nowS - (REFRESH_AFTER - 0.6));
+        st.lastOk = nowS; st.mediaEnd = 0; st.lastError = ""; st.lastErr = null;
+        return;
+      } catch (e) { last = errMsg(e); }
+    }
+    if (attempt === 0) {
+      try {
+        await ensureBkUrls(ch, st, ctx, true);
+      } catch (e) {
+        last = errMsg(e);
+        if (e && e.status === 429) bkGate.blockedUntil = Date.now() + Math.max(THROTTLE_MIN, parseRetryAfter(e.retryAfter)) * 1000;
+        break;
+      }
     }
   }
-  bkUrls.delete(ch.slug);
-  throw new Error(last || "bk playlist failed");
+  st.bk = { urls: [], t: 0, lastTail: "", lastHost: "", refreshing: false };
+  await sharedDel("bk-" + ch.slug);
+  throw new Error(last.slice(0, 120) || "bk playlist failed");
 }
 
-async function livePlaylist(ch) {
-  const now = Date.now();
-  let order;
-  let note = "";
-  if (FORCE_BK.has(ch.slug)) order = ["bk"];
-  else if (cfg.mode === "bk") order = ["bk", "jce"];
-  else if (cfg.mode === "auto" && (sticky.get(ch.slug) || 0) > now) { order = ["bk", "jce"]; note = "sticky->bk"; }
-  else order = ["jce", "bk"];
-
-  const errs = [];
-  for (const m of order) {
+// ---- 刷新调度 / 对外服务 ----
+async function runJceWithRetry(ch, st) {
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      const pl = m === "bk" ? await viaBk(ch) : await viaJce(ch);
-      return { pl, mode: m, note: errs.length ? errs.join(" | ").slice(0, 160) : note };
+      await jceRefresh(ch, st);
+      return;
     } catch (e) {
-      errs.push(`${m}: ${errMsg(e)}`);
-      if (m === "jce" && cfg.mode === "auto") sticky.set(ch.slug, Date.now() + STICKY_MS);
-    }
-  }
-  throw new Error(errs.join(" | "));
-}
-
-function cachedLive(ch) {
-  const m = memo.get(ch.slug);
-  if (m && m.pl && Date.now() - m.t < PLAYLIST_TTL) return Promise.resolve({ ...m, hit: true });
-  if (m && m.p) return m.p.then((r) => ({ ...r, hit: true }));
-  const p = livePlaylist(ch).then(
-    (r) => {
-      memo.set(ch.slug, { t: Date.now(), pl: r.pl, mode: r.mode, note: r.note });
-      return r;
-    },
-    (e) => {
-      const old = memo.get(ch.slug);
-      memo.set(ch.slug, { t: old?.t || 0, pl: old?.pl, mode: old?.mode, note: old?.note });
-      if (old?.pl && Date.now() - old.t < STALE_TTL) return { ...old, hit: true, stale: true, note: errMsg(e).slice(0, 120) };
+      if (e instanceof Reopen && attempt === 0) {
+        resetContinuity(st);
+        continue;
+      }
+      if (e instanceof Reopen) resetContinuity(st);
       throw e;
     }
-  );
-  memo.set(ch.slug, { t: m?.t || 0, pl: m?.pl, mode: m?.mode, note: m?.note, p });
+  }
+}
+
+async function refreshOnce(ch, st, ctx) {
+  const mode = effectiveMode(ch, st);
+  if (mode === "bk") {
+    try {
+      await bkRefresh(ch, st, ctx);
+      return;
+    } catch (bkErr) {
+      // 仅在冷启动完全无列表 (!st.playlist) 时才尝试 JCE 兜底;
+      // 正常播放中途绝不切往 JCE (播放中途切 JCE 会因序号体系不同直接导致播放器断连或卡死)
+      if (cfg.mode === "auto" && !st.playlist && !FORCE_BK.has(ch.slug) && TIMESHIFT_SUPPORTED.has(ch.slug)) {
+        st.mode = "jce";
+        st.stickyUntil = Date.now() + STICKY_MS;
+        resetContinuity(st);
+        await runJceWithRetry(ch, st);
+        return;
+      }
+      throw bkErr;
+    }
+  }
+
+  // 当前在 jce 模式
+  try {
+    await runJceWithRetry(ch, st);
+    return;
+  } catch (jceErr) {
+    if (!FORCE_JCE.has(ch.slug) && cfg.mode !== "jce") {
+      st.mode = "bk";
+      st.stickyUntil = Date.now() + STICKY_MS;
+      resetContinuity(st);
+      await bkRefresh(ch, st, ctx);
+      return;
+    }
+    throw jceErr;
+  }
+}
+
+function refreshLive(ch, st, ctx, background) {
+  if (st.inflight && Date.now() - st.inflightAt < P_MAX) return st.inflight;
+  if (background && Date.now() < st.retryAt) return Promise.resolve(false);
+  const p = (async () => {
+    try {
+      await refreshOnce(ch, st, ctx);
+      st.fails = 0; st.retryAt = 0;
+      return true;
+    } catch (e) {
+      st.lastErr = e; st.lastError = errMsg(e).slice(0, 160); st.fails++;
+      st.retryAt = Date.now() + (e instanceof RateLimited ? Math.min(15000, e.retry * 1000) : (st.fails < 3 ? 1500 : 5000));
+      return false;
+    } finally {
+      if (st.inflight === p) st.inflight = null;
+    }
+  })();
+  st.inflight = p; st.inflightAt = Date.now();
+  if (ctx && ctx.waitUntil) ctx.waitUntil(p);
   return p;
+}
+
+function playlistUsable(st, mode, nowS) {
+  if (!st.playlist) return false;
+  if (nowS - st.builtAt >= FRESH_MAX) return false;
+  if (nowS - st.lastOk > LOW_PLAYLIST_MAX_AGE) return false;
+  if (mode === "jce" && st.mediaEnd && nowS - st.mediaEnd > 90) return false;
+  return true;
+}
+
+async function serveLive(ch, ctx, useProxy = false) {
+  const st = liveState(ch);
+  let mode = effectiveMode(ch, st);
+  const nowS = Date.now() / 1000;
+  if (mode === "jce" && nowS - st.lastAccess >= LOW_IDLE && !st.inflight) resetContinuity(st);
+  st.lastAccess = nowS;
+
+  const usable = () => playlistUsable(st, effectiveMode(ch, st), Date.now() / 1000);
+  let cache = "HIT";
+  const ageSec = Date.now() / 1000 - st.builtAt;
+
+  if (usable() && ageSec <= REFRESH_AFTER) {
+    cache = "HIT";
+  } else if (usable()) {
+    const prevBuiltAt = st.builtAt;
+    await waitFor(refreshLive(ch, st, ctx, false), SYNC_WAIT_MS);
+    cache = st.builtAt > prevBuiltAt ? "REFRESH" : "SWR";
+  } else {
+    cache = "MISS";
+    await waitFor(refreshLive(ch, st, ctx, false), COLD_WAIT_MS);
+  }
+
+  mode = effectiveMode(ch, st);
+  if (usable() || (st.playlist && Date.now() / 1000 - st.lastOk <= LOW_PLAYLIST_MAX_AGE)) {
+    const body = useProxy ? rewritePlaylistProxy(st.playlist, mode) : st.playlist;
+    return new Response(body, {
+      status: 200,
+      headers: {
+        "Content-Type": M3U8,
+        "Cache-Control": "no-cache, no-store, max-age=0",
+        "X-Mode": mode,
+        "X-Cache": cache,
+        "X-Age": (Date.now() / 1000 - st.builtAt).toFixed(1),
+        ...(st.bk.lastHost && mode === "bk" ? { "X-Host": st.bk.lastHost } : {}),
+        ...(useProxy ? { "X-Proxy": "1" } : {}),
+        ...CORS,
+      },
+    });
+  }
+  const limitedFor = Math.max(gateRemainingSec(), (st.mediaBlockedUntil - Date.now()) / 1000, mode === "bk" ? (bkGate.blockedUntil - Date.now()) / 1000 : 0);
+  const limited = limitedFor > 0;
+  const msg = limited
+    ? `频道 ${ch.name}: 上游限流冷却中, 约 ${Math.ceil(limitedFor)} 秒后再试` + (gateRemainingSec() > 0 && gate.last ? ` [上游返回: ${gate.last.detail}; 触发于 ${gate.last.channel || "?"} ${gate.last.at}; 连续限流等级 ${gate.penalty}s]` : (st.lastError ? ` [${st.lastError}]` : ""))
+    : `频道 ${ch.name} 暂无数据 (${st.inflight ? "拉取中" : (st.lastError || "无可用列表")}), 请稍后重试`;
+  return reply(msg + "\n", 503, "text/plain; charset=utf-8", { "Retry-After": String(limited ? Math.ceil(limitedFor) : 2) });
+}
+
+// ---- 分片代理 (/seg?u=...) ----
+const ALLOWED_SEG_HOST = /\.(cctv\.cn|cctv\.com|myalicdn\.com|rtx3090\.com|gitv\.tv|cntv\.cn)$/i;
+async function handleSegProxy(request, sp) {
+  const rawUrl = sp.get("u");
+  if (!rawUrl) return reply("missing u\n", 400);
+  let target;
+  try { target = new URL(rawUrl); } catch { return reply("bad url\n", 400); }
+  if (target.protocol !== "http:" && target.protocol !== "https:") return reply("bad scheme\n", 400);
+  const isIp = /^\d{1,3}(\.\d{1,3}){3}$/.test(target.hostname);
+  if (!isIp && !ALLOWED_SEG_HOST.test(target.hostname)) return reply("forbidden host\n", 403);
+
+  const mode = sp.get("m") === "jce" ? "jce" : "bk";
+  const reqHeaders = new Headers(mode === "bk" ? H_BK : H_JCE);
+  const range = request.headers.get("Range") || request.headers.get("range");
+  if (range) reqHeaders.set("Range", range);
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const r = await fetch(target.toString(), {
+        method: request.method === "HEAD" ? "HEAD" : "GET",
+        headers: reqHeaders,
+        redirect: "follow",
+        cf: { cacheTtl: 60, cacheEverything: true },
+        signal: AbortSignal.timeout(8000),
+      });
+      if (r.status >= 500 && attempt === 0) continue;
+      const resHeaders = new Headers(CORS);
+      resHeaders.set("Content-Type", r.headers.get("Content-Type") || "video/mp2t");
+      resHeaders.set("Cache-Control", "public, max-age=60");
+      for (const h of ["Content-Length", "Content-Range", "Accept-Ranges"]) {
+        const v = r.headers.get(h);
+        if (v) resHeaders.set(h, v);
+      }
+      return new Response(r.body, { status: r.status, headers: resHeaders });
+    } catch (e) {
+      if (attempt === 1) return reply(`segment proxy error: ${errMsg(e)}\n`, 502);
+    }
+  }
 }
 
 // ---- 回看 ----
@@ -953,7 +1506,7 @@ const countSegs = (text) => (text.match(/#EXTINF:/g) || []).length;
 const transient = (e) => !!(e && (e.dead || e.name === "TimeoutError" || /HTTP 5\d\d|fetch failed|network/i.test(errMsg(e))));
 
 async function jceRangeText(ch, start, end, defn) {
-  const u = await jceTimeshiftUrl(ch.pid, ch.sid, start, end, defn, CU_JACC_TIMEOUT);
+  const u = await jaccUrl(ch, start, end, defn, CU_JACC_TIMEOUT);
   const { text, final } = await fetchPlaylistAny(u, [H_JCE, H_BK], CU_FETCH_TIMEOUT);
   if (!text.includes("#EXTINF")) throw new Error("empty playlist");
   return { text, final };
@@ -969,14 +1522,12 @@ async function catchupWhole(ch, start, end) {
       try {
         const r = await jceRangeText(ch, start, end, defn);
         return { ...r, defn, dur: sumExtinf(r.text) };
-      } catch (e) { last = e; if (!transient(e)) break; }
+      } catch (e) { last = e; if (e instanceof RateLimited) throw e; if (!transient(e)) break; }
     }
   }
   throw last;
 }
 
-// 分段兜底: 上游对长区间报错/截断时, 按 CU_CHUNK 切段并发申请再拼接
-// [FIX] 提取分片 URL 末尾真实文件名(忽略路径中每次变化的 200 位动态加密 Token)进行去重, 消除分段交界处重复切片引起的色块卡顿
 async function catchupChunked(ch, start, end, defn) {
   const ranges = [];
   for (let t = start; t < end; t += CU_CHUNK) ranges.push([t, Math.min(t + CU_CHUNK, end)]);
@@ -1018,7 +1569,7 @@ async function catchupChunked(ch, start, end, defn) {
 async function catchupPlaylist(ch, start, end) {
   const want = end - start;
   let whole = null, err = null;
-  try { whole = await catchupWhole(ch, start, end); } catch (e) { err = e; }
+  try { whole = await catchupWhole(ch, start, end); } catch (e) { err = e; if (e instanceof RateLimited) throw e; }
   if (whole && whole.dur >= want * 0.9) {
     return { pl: absolutize(whole.text, whole.final, true), mode: "whole", segs: countSegs(whole.text), dur: whole.dur };
   }
@@ -1033,14 +1584,16 @@ async function catchupPlaylist(ch, start, end) {
   throw err || new Error("catchup failed");
 }
 
-function cachedCatchup(ch, cu) {
+function cachedCatchup(ch, cu, ctx) {
   const key = `${ch.slug}|${cu.start}|${cu.end}`;
   const hit = cuCache.get(key);
-  if (hit && Date.now() - hit.t < CU_CACHE_TTL) return hit.p;
+  if (hit && Date.now() - hit.t < CU_CACHE_TTL && (hit.done || Date.now() - hit.t < CU_PEND_MAX)) return hit.p;
   const p = catchupPlaylist(ch, cu.start, cu.end);
   if (!cu.open) {
-    cuCache.set(key, { t: Date.now(), p });
-    p.catch(() => { if (cuCache.get(key)?.p === p) cuCache.delete(key); });
+    const ent = { t: Date.now(), p, done: false };
+    cuCache.set(key, ent);
+    p.then(() => { ent.done = true; }, () => { if (cuCache.get(key) === ent) cuCache.delete(key); });
+    if (ctx && ctx.waitUntil) ctx.waitUntil(p.catch(() => {}));
     if (cuCache.size > 40) cuCache.delete(cuCache.keys().next().value);
   }
   return p;
@@ -1050,9 +1603,12 @@ function cachedCatchup(ch, cu) {
 function allM3u(origin, sp, tokenQs) {
   const group = sp.get("group");
   const only4k = ["1", "true", "yes"].includes((sp.get("k4") || "0").toLowerCase());
+  const useProxy = cfg.proxyTs || ["1", "true", "yes"].includes((sp.get("proxy") || "0").toLowerCase());
   const mode = (sp.get("mode") || "").toLowerCase();
   const tzQ = (sp.get("tz") || "").trim();
-  const sep = tokenQs ? "&" : "?";
+  const proxyPart = useProxy ? (tokenQs ? "&proxy=1" : "?proxy=1") : "";
+  const baseQs = tokenQs + proxyPart;
+  const sep = baseQs ? "&" : "?";
   const fmt = "${(b)yyyyMMddHHmmss}-${(e)yyyyMMddHHmmss}";
   const tzPart = tzQ ? "&tz=" + encodeURIComponent(tzQ) : "";
   const epgUrl = `${origin}/epg.xml${tokenQs}`;
@@ -1066,7 +1622,7 @@ function allM3u(origin, sp, tokenQs) {
     const grp = groupOf(c.slug);
     if (group && !grp.includes(group)) continue;
     if (only4k && !TRUE_4K.has(c.slug)) continue;
-    const chUrl = `${origin}/${c.slug}.m3u8${tokenQs}`;
+    const chUrl = `${origin}/${c.slug}.m3u8${baseQs}`;
     let attrs = ` tvg-id="${TVG_IDS[c.slug] || c.slug.toUpperCase()}" tvg-name="${c.name}" tvg-logo="${LOGO_BASE}/${c.slug}.png" group-title="${grp}"`;
     if (TIMESHIFT_SUPPORTED.has(c.slug)) {
       attrs += mode === "utc"
@@ -1130,8 +1686,6 @@ async function handleEpg(request, ctx, wantGz) {
 }
 
 // ---- 诊断: /<channel>.m3u8?debug=1 ----
-const stripQ = (u) => String(u).split("?")[0];
-const hostOf = (u) => { try { return new URL(u).host; } catch { return "?"; } };
 async function probeSeg(u) {
   const t = Date.now();
   try {
@@ -1142,62 +1696,85 @@ async function probeSeg(u) {
     return { status: r.status, ms: Date.now() - t, type: r.headers.get("content-type"), len: r.headers.get("content-length"), firstByte: value && value.length ? (value[0] === 0x47 ? "0x47(TS)" : "0x" + value[0].toString(16)) : null };
   } catch (e) { return { error: errMsg(e), ms: Date.now() - t }; }
 }
-async function debugChannel(ch, cu) {
-  const out = { channel: ch.slug, version: VERSION, mode: cfg.mode, guid: GUID.slice(0, 6) + "…", forceBk: FORCE_BK.has(ch.slug), stickyUntil: sticky.get(ch.slug) || 0 };
-  const t0 = Date.now();
-  try {
-    const now = Math.floor(Date.now() / 1e3);
-    const u = await jceTimeshiftUrl(ch.pid, ch.sid, now - JCE_WINDOW, now, ch.defn);
-    const { text, final } = await fetchMediaPlaylist(u, H_JCE);
-    const segs = parseMedia(text, final);
-    out.jce = { ok: true, ms: Date.now() - t0, m3u8: stripQ(u), segments: segs.length, hasPdt: !!segs[0]?.pdt, firstSeg: segs[0] && stripQ(segs[0].url), seq: segs.length ? stableSeq(ch.slug, segs.slice(-KEEP_SEGS)) : null, head: text.split(/\r?\n/).slice(0, 8) };
-  } catch (e) { out.jce = { ok: false, ms: Date.now() - t0, error: errMsg(e) }; }
-  const t1 = Date.now();
-  try {
-    const urls = await bkPlayUrls(ch.sid, ch.pid, ch.defn);
-    const { text, final } = await fetchMediaPlaylist(urls[0], H_BK);
-    const segs = parseMedia(text, final);
-    out.bk = { ok: true, ms: Date.now() - t1, urls: urls.map(stripQ), segments: segs.length, firstSeg: segs[0] && stripQ(segs[0].url), head: text.split(/\r?\n/).slice(0, 8) };
-  } catch (e) { out.bk = { ok: false, ms: Date.now() - t1, error: errMsg(e) }; }
-
-  const now2 = Math.floor(Date.now() / 1e3);
+async function debugChannel(ch, cu, sp, ctx) {
+  const st = liveState(ch);
+  const age = (t) => (t ? +(Date.now() / 1000 - t).toFixed(1) : null);
+  const out = {
+    channel: ch.slug, version: VERSION, mode: cfg.mode, effectiveMode: effectiveMode(ch, st), guid: GUID.slice(0, 6) + "…", forceBk: FORCE_BK.has(ch.slug),
+    gate: { blockedForSec: Math.round(gateRemainingSec()), penalty: gate.penalty, lastThrottle: gate.last, nextSlotInMs: Math.max(0, Math.round(gate.next - Date.now())) },
+    sharedCache: await sharedProbe(),
+    live: {
+      bkLastHost: st.bk.lastHost || null,
+      bkPoolSize: st.bk.urls.length,
+      bkPoolAgeSec: st.bk.t ? Math.round((Date.now() - st.bk.t) / 1000) : null,
+      anchor: st.anchor && { host: hostOf(st.anchor.url), expiresInSec: Math.round((st.anchor.expiry - Date.now()) / 1000), gen: st.anchor.gen, sharedOffset: st.anchor.offset ?? null },
+      accepted: !!st.anchor && st.accepted === st.anchor.gen, offset: st.offset, tailSeq: st.tail ? st.tail[0] : null, target: st.target, pdtPrecise: st.precise, suppressPdt: st.suppressPdt,
+      playlistAgeSec: age(st.builtAt), mediaEndAgeSec: st.mediaEnd ? age(st.mediaEnd) : null, lastOkAgeSec: age(st.lastOk),
+      lastError: st.lastError || null, fails: st.fails, retryInSec: Math.max(0, Math.round((st.retryAt - Date.now()) / 1000)),
+      mediaBlockedForSec: Math.max(0, Math.round((st.mediaBlockedUntil - Date.now()) / 1000)), inflight: !!st.inflight,
+    },
+  };
+  if (sp.get("probe") === "1") {
+    st.lastAccess = Date.now() / 1000;
+    const t0 = Date.now();
+    const ok = await refreshLive(ch, st, ctx, false);
+    const urls = (st.playlist.match(/^https?:\/\/.*$/gm) || []);
+    out.probe = { ok, ms: Date.now() - t0, error: ok ? null : st.lastError, segments: urls.length, head: st.playlist.split(/\r?\n/).slice(0, 6) };
+    if (urls.length) out.probe.segFirst = await probeSeg(urls[0]), out.probe.segLast = await probeSeg(urls[urls.length - 1]);
+  }
+  if (sp.get("raw") === "1") {
+    try { out.raw = await rawPlaylistReport(st); } catch (e) { out.raw = { error: errMsg(e) }; }
+  }
+  if (sp.get("bk") === "1") {
+    const t1 = Date.now();
+    try {
+      await bkSlot();
+      const urls = await bkPlayUrls(ch.sid, ch.pid, ch.defn);
+      const { text, final } = await fetchMediaPlaylist(urls[0], H_BK, 0, BK_TIMEOUT);
+      const segs = parseMedia(text, final);
+      out.bk = { ok: true, ms: Date.now() - t1, urls: urls.map(stripQ), segments: segs.length, firstSeg: segs[0] && stripQ(segs[0].url), head: text.split(/\r?\n/).slice(0, 8) };
+    } catch (e) { out.bk = { ok: false, ms: Date.now() - t1, error: errMsg(e) }; }
+  }
   const own = !!(cu && !cu.bad);
-  const rq = own ? cu : { start: now2 - 2400, end: now2 - 600 };
-  const t2 = Date.now();
-  const cd = { selfTest: !own, supported: TIMESHIFT_SUPPORTED.has(ch.slug), tz: cfg.tz, start: rq.start, end: rq.end, startBJ: fmtBJ(rq.start), endBJ: fmtBJ(rq.end), spanSec: rq.end - rq.start };
-  if (cu && cu.bad) cd.paramError = cu.bad;
-  out.catchup = cd;
-  try {
-    const u = await jceTimeshiftUrl(ch.pid, ch.sid, rq.start, rq.end, ch.defn, CU_JACC_TIMEOUT);
-    cd.jaccMs = Date.now() - t2;
-    cd.m3u8 = stripQ(u);
-    const { text, final } = await fetchPlaylistAny(u, [H_JCE, H_BK], CU_FETCH_TIMEOUT);
-    const segs = parseMedia(text, final);
-    const dur = sumDur(segs);
-    Object.assign(cd, {
-      ok: segs.length > 0, ms: Date.now() - t2, host: hostOf(final), segments: segs.length,
-      coverageSec: Math.round(dur), coverage: rq.end > rq.start ? +(dur / (rq.end - rq.start)).toFixed(2) : null,
-      hasEndlist: text.includes("#EXT-X-ENDLIST"), hasDiscontinuity: segs.some((s) => s.disc),
-      firstSeg: segs[0] && stripQ(segs[0].url), lastSeg: segs.length ? stripQ(segs[segs.length - 1].url) : null,
-      head: text.split(/\r?\n/).slice(0, 8),
-    });
-    cd.scheme = segs[0] ? segs[0].url.split(":")[0] : null;
-    cd.tail = text.split(/\r?\n/).filter(Boolean).slice(-3).map((l) => (l[0] === "#" ? l : stripQ(l).slice(-60)));
-    if (!segs.length) cd.error = "empty playlist";
-    else {
-      cd.probe = { first: await probeSeg(segs[0].url), last: await probeSeg(segs[segs.length - 1].url) };
-      const bad = [cd.probe.first, cd.probe.last].some((p) => p.error || p.status >= 400);
-      if (bad) cd.hint = "播放列表拿到了, 但分片本身取不到: 多半是分片地址有时效/防盗链/出口 IP 限制 (first 与 last 状态不同则说明地址有时效或该时段无录像)";
-      else if (cd.coverage !== null && cd.coverage < 0.9) cd.hint = "上游只返回了部分时长, 实际回看会自动走分段拼接兜底";
-      else if (cd.scheme === "http") cd.hint = "分片是明文 http://: 直播同样如此, 若直播能播则不是问题; 浏览器/iOS ATS 类播放器可能拦截";
+  if (own || sp.get("catchup") === "1") {
+    const now2 = Math.floor(Date.now() / 1e3);
+    const rq = own ? cu : { start: now2 - 2400, end: now2 - 600 };
+    const t2 = Date.now();
+    const cd = { selfTest: !own, supported: TIMESHIFT_SUPPORTED.has(ch.slug), tz: cfg.tz, start: rq.start, end: rq.end, startBJ: fmtBJ(rq.start), endBJ: fmtBJ(rq.end), spanSec: rq.end - rq.start };
+    if (cu && cu.bad) cd.paramError = cu.bad;
+    out.catchup = cd;
+    try {
+      const u = await jaccUrl(ch, rq.start, rq.end, ch.defn, CU_JACC_TIMEOUT);
+      cd.jaccMs = Date.now() - t2;
+      cd.m3u8 = stripQ(u);
+      const { text, final } = await fetchPlaylistAny(u, [H_JCE, H_BK], CU_FETCH_TIMEOUT);
+      const segs = parseMedia(text, final);
+      const dur = sumDur(segs);
+      Object.assign(cd, {
+        ok: segs.length > 0, ms: Date.now() - t2, host: hostOf(final), segments: segs.length,
+        coverageSec: Math.round(dur), coverage: rq.end > rq.start ? +(dur / (rq.end - rq.start)).toFixed(2) : null,
+        hasEndlist: text.includes("#EXT-X-ENDLIST"), hasDiscontinuity: segs.some((s) => s.disc),
+        firstSeg: segs[0] && stripQ(segs[0].url), lastSeg: segs.length ? stripQ(segs[segs.length - 1].url) : null,
+        head: text.split(/\r?\n/).slice(0, 8),
+      });
+      cd.scheme = segs[0] ? segs[0].url.split(":")[0] : null;
+      cd.tail = text.split(/\r?\n/).filter(Boolean).slice(-3).map((l) => (l[0] === "#" ? l : stripQ(l).slice(-60)));
+      if (!segs.length) cd.error = "empty playlist";
+      else {
+        cd.probe = { first: await probeSeg(segs[0].url), last: await probeSeg(segs[segs.length - 1].url) };
+        const bad = [cd.probe.first, cd.probe.last].some((p) => p.error || p.status >= 400);
+        if (bad) cd.hint = "播放列表拿到了, 但分片本身取不到: 可尝试加 ?proxy=1 走 Worker 代理分片";
+        else if (cd.coverage !== null && cd.coverage < 0.9) cd.hint = "上游只返回了部分时长, 实际回看会自动走分段拼接兜底";
+        else if (cd.scheme === "http") cd.hint = "分片是明文 http://: 若浏览器或 HTTPS 播放器拦截, 可加 ?proxy=1 或设环境变量 PROXY_TS=1";
+      }
+    } catch (e) {
+      cd.ok = false;
+      cd.ms = Date.now() - t2;
+      cd.error = errMsg(e);
+      if (e.dead) cd.hint = `JACC 返回了已失效的 CDN 域名 (${e.host}), 回看会自动重试/换清晰度; 若始终如此则是上游限制`;
+      else if (/errCode|ret|code/i.test(cd.error)) cd.hint = "JACC 明确拒绝了该请求: 常见原因是超出回看保留期、节目时间段无录像, 或出口 IP/地区受限";
+      else if (e.name === "TimeoutError") cd.hint = "请求 JACC/CDN 超时: 可能是出口节点到上游网络质量差";
     }
-  } catch (e) {
-    cd.ok = false;
-    cd.ms = Date.now() - t2;
-    cd.error = errMsg(e);
-    if (e.dead) cd.hint = `JACC 返回了已失效的 CDN 域名 (${e.host}), 回看会自动重试/换清晰度; 若始终如此则是上游限制`;
-    else if (/errCode|ret|code/i.test(cd.error)) cd.hint = "JACC 明确拒绝了该请求: 常见原因是超出回看保留期、节目时间段无录像, 或出口 IP/地区受限";
-    else if (e.name === "TimeoutError") cd.hint = "请求 JACC/CDN 超时: 可能是出口节点到上游网络质量差";
   }
   return reply(JSON.stringify(out, null, 2), 200, "application/json; charset=utf-8");
 }
@@ -1208,15 +1785,20 @@ export default {
     env = env || {};
     opts.nativeGzip = env.NATIVE_GZIP === "1";
     cfg.mode = env.LIVE_MODE === "jce" || env.LIVE_MODE === "bk" ? env.LIVE_MODE : "auto";
+    cfg.proxyTs = env.PROXY_TS === "1";
+    cfg.token = env.TOKEN || "";
     const ipTz = request.cf?.timezone || null;
     const envTz = String(env.CATCHUP_TZ || "").trim();
     const tzDefault = envTz.toLowerCase() === "auto" ? parseTz(ipTz, 480) : parseTz(envTz, 480);
     cfg.tz = tzDefault;
+    const po = Number(env.PDT_OVERLAP_MAX);
+    cfg.overlapMax = Number.isFinite(po) && po >= 0.05 && po <= 3 ? po : 1.2;
     const mx = Number(env.CATCHUP_MAX);
-    cfg.max = mx >= 600 && mx <= 43200 ? mx : 14400; // 默认回看最大跨度 14400 秒 (4 小时)
+    cfg.max = mx >= 600 && mx <= 43200 ? mx : 14400;
     initGuid(env.GUID);
 
     const url = new URL(request.url);
+    cfg.origin = url.origin;
     const { pathname: path } = url;
     const sp = new URLSearchParams(url.search.replace(/\?/g, (m, i) => (i === 0 ? m : "&")));
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: { ...CORS, "Access-Control-Allow-Methods": "GET,HEAD,OPTIONS", "Access-Control-Allow-Headers": "*" } });
@@ -1231,16 +1813,24 @@ export default {
       return reply(
         `ysp-live IPTV 直播网关 (Cloudflare Worker ${VERSION})\n\n` +
         `1. 通用订阅 (TVBox / 影视仓 / APTV 等):\n   ${url.origin}/all.m3u${qs}\n\n` +
-        `2. ynoTV (Windows) / TiviMate / Kodi 订阅:\n   ${url.origin}/all.m3u${qs}${sp2}mode=utc\n\n` +
-        `3. EPG 节目单:\n   ${url.origin}/epg.xml${qs}\n   ${url.origin}/epg.xml.gz${qs}\n\n` +
-        `4. 仅 4K/8K 频道:\n   ${url.origin}/all.m3u${qs}${sp2}k4=1\n\n` +
-        `5. 排障:\n   ${url.origin}/health${qs}\n   ${url.origin}/last${qs}\n   ${url.origin}/cctv1.m3u8${qs}${sp2}debug=1\n` +
+        `2. 分片代理订阅 (推荐在直连 CDN 偶发黑屏/断连时使用):\n   ${url.origin}/all.m3u${qs}${sp2}proxy=1\n\n` +
+        `3. ynoTV (Windows) / TiviMate / Kodi 订阅:\n   ${url.origin}/all.m3u${qs}${sp2}mode=utc\n\n` +
+        `4. EPG 节目单:\n   ${url.origin}/epg.xml${qs}\n   ${url.origin}/epg.xml.gz${qs}\n\n` +
+        `5. 仅 4K/8K 频道:\n   ${url.origin}/all.m3u${qs}${sp2}k4=1\n\n` +
+        `6. 排障:\n   ${url.origin}/health${qs}\n   ${url.origin}/last${qs}\n   ${url.origin}/cctv1.m3u8${qs}${sp2}debug=1&probe=1\n` +
         (authed || !env.TOKEN ? "" : "\n(已设置 TOKEN: 请把上面的 \"你的TOKEN\" 换成真实口令)\n")
       );
     }
     if (path === "/favicon.ico") return reply('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">📺</text></svg>', 200, "image/svg+xml");
+    if (path === "/seg") return handleSegProxy(request, sp);
     if (path === "/health") {
-      return reply(JSON.stringify({ ok: true, version: VERSION, mode: cfg.mode, channels: CHANNELS.length, catchupTz: cfg.tz, catchupMax: cfg.max, ipTz, colo: request.cf?.colo || null, routes: ["/all.m3u", "/all.m3u?mode=utc", "/epg.xml", "/epg.xml.gz", "/health", "/last", "/<channel>.m3u8"] }, null, 2), 200, "application/json; charset=utf-8");
+      return reply(JSON.stringify({
+        ok: true, version: VERSION, mode: cfg.mode, proxyTs: cfg.proxyTs, channels: CHANNELS.length, catchupTz: cfg.tz, catchupMax: cfg.max,
+        gate: { blockedForSec: Math.round(gateRemainingSec()), penalty: gate.penalty, lastThrottle: gate.last },
+        sharedCache: await sharedProbe(), liveChannelsInMemory: LIVE.size,
+        ipTz, colo: request.cf?.colo || null,
+        routes: ["/all.m3u", "/all.m3u?proxy=1", "/all.m3u?mode=utc", "/epg.xml", "/epg.xml.gz", "/health", "/last", "/<channel>.m3u8", "/seg"],
+      }, null, 2), 200, "application/json; charset=utf-8");
     }
     if (path === "/last") {
       return reply(JSON.stringify({
@@ -1260,10 +1850,11 @@ export default {
     if (!ch) return reply("未知频道\n", 404);
 
     const cu = parseCatchup(sp, tzDefault, cfg.max, ipTz);
-    if (sp.has("debug")) return debugChannel(ch, cu);
+    if (sp.has("debug")) return debugChannel(ch, cu, sp, ctx);
 
+    const useProxy = cfg.proxyTs || ["1", "true", "yes"].includes((sp.get("proxy") || "0").toLowerCase());
     const t0 = Date.now();
-    const hasParams = [...sp.keys()].some((k) => k !== "token");
+    const hasParams = [...sp.keys()].some((k) => k !== "token" && k !== "proxy");
     const note = (res, extra = {}) => {
       const e = { at: new Date().toISOString(), path, q: maskQ(url.search), status: res.status, ms: Date.now() - t0, ua: (request.headers.get("user-agent") || "").slice(0, 90), ipTz, ...extra };
       if (hasParams) { pushLog(reqLog, e, 30); console.log("[req]", JSON.stringify(e)); }
@@ -1280,8 +1871,9 @@ export default {
       if (cu.bad) return note(reply(cu.bad + "\n", 400), { bad: cu.bad });
       if (!TIMESHIFT_SUPPORTED.has(slug)) return note(reply(`${ch.name} 不支持回看\n`, 400));
       try {
-        const r = await cachedCatchup(ch, cu);
-        return note(new Response(r.pl, {
+        const r = await cachedCatchup(ch, cu, ctx);
+        const body = useProxy ? rewritePlaylistProxy(r.pl, "jce") : r.pl;
+        return note(new Response(body, {
           status: 200,
           headers: {
             "Content-Type": M3U8,
@@ -1291,31 +1883,18 @@ export default {
             "X-Catchup-Segs": String(r.segs),
             "X-Catchup-Dur": String(Math.round(r.dur)),
             ...(r.gaps ? { "X-Catchup-Gaps": String(r.gaps) } : {}),
+            ...(useProxy ? { "X-Proxy": "1" } : {}),
             ...CORS,
           },
         }), { ...asked, mode: r.mode, segs: r.segs });
       } catch (e) {
+        if (e instanceof RateLimited) return note(reply(`回看暂不可用: 上游限流冷却中, 约 ${e.retry} 秒后再试\n`, 503, "text/plain; charset=utf-8", { "Retry-After": String(e.retry) }), { ...asked, error: errMsg(e).slice(0, 160) });
         return note(reply(`回看失败 ${ch.name} ${fmtBJ(cu.start)} ~ ${fmtBJ(cu.end)} (${errMsg(e)})\n可访问 ${url.origin}/${slug}.m3u8${tokenQs ? tokenQs + "&" : "?"}debug=1 查看诊断\n`, 502), { ...asked, error: errMsg(e).slice(0, 160) });
       }
     }
 
     // 直播
-    try {
-      const r = await cachedLive(ch);
-      return note(new Response(r.pl, {
-        status: 200,
-        headers: {
-          "Content-Type": M3U8,
-          "Cache-Control": "no-cache",
-          "X-Mode": r.mode,
-          "X-Cache": r.hit ? "HIT" : "MISS",
-          ...(r.stale ? { "X-Stale": "1" } : {}),
-          ...(r.note ? { "X-Fallback-Reason": r.note.replace(/[^\x20-\x7e]/g, "?") } : {}),
-          ...CORS,
-        },
-      }), { mode: r.mode });
-    } catch (e) {
-      return note(reply(`频道 ${ch.name} 暂无数据 (${errMsg(e)}), 请稍后重试\n`, 503, "text/plain; charset=utf-8", { "Retry-After": "2" }), { error: errMsg(e).slice(0, 160) });
-    }
+    const res = await serveLive(ch, ctx, useProxy);
+    return note(res, { mode: res.headers.get("X-Mode") || undefined, cache: res.headers.get("X-Cache") || undefined });
   },
 };
