@@ -1,5 +1,5 @@
 // ============================================================
-// ysp-live IPTV 直播网关 (Cloudflare Worker, 单文件)  v11.5.0
+// ysp-live IPTV 直播网关 (Cloudflare Worker, 单文件)  v11.5.1
 // 基于实测流畅的 v11.3 架构精简优化 (原生 BK 直通 + 60s 后台同源热续期)
 // ============================================================
 // 环境变量 (均可选):
@@ -24,6 +24,12 @@
 //      既拿到全新 Token 又保持落点在同一台上游打包服务器上, 保证 MEDIA-SEQUENCE 连续不跳变
 //   4. 禁止播放中途切 JCE + 2.5 秒快速切备用源: 播放中途遇瞬时网络抖动用旧列表兜底并在下一轮重试 bk,
 //      绝不在中途切到 JCE 造成断流; 单次 m3u8 拉取超时设为 2.5 秒以便在单次轮询内快速切到备用地址
+//
+// v11.5.1 说明 (基于 v11.5.0 精细打磨防偶发黑屏/断连, 不改动主架构):
+//   1. 提前 Token 续期边界: BK_PREFETCH_MS=45s, BK_URL_TTL=70s, 共享缓存 65s, 给 .ts 下载与缓冲留足余量
+//   2. 放宽热更新窗口: FRESH_MAX=18s, SYNC_WAIT_MS=3.2s, P_MAX=15s, 避免 6s 轮询掉入 10s 冷启动等待
+//   3. 分片代理防截断: /seg 超时提升至 15s, 防止高码率 FHD/4K 分片传输中途被超时中断
+//   4. 防边缘节点序号倒退与无谓切源: 同域名 MEDIA-SEQUENCE 小幅倒退不覆盖, 遇 401/403/410 立即刷池, 瞬时失败保留 lastHost
 // ============================================================
 
 // ---------------- channels ----------------
@@ -613,7 +619,7 @@ async function bkPlayUrls(channelId, livePid, defn = "fhd") {
 }
 
 // ---------------- 网关主体 ----------------
-const VERSION = "11.5.0-cf-opt";
+const VERSION = "11.5.1-cf-opt";
 const UA_BROWSER = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
 const H_JCE = { "User-Agent": UA_BROWSER, Accept: "*/*" };
 const H_BK = { "User-Agent": "qqlive", Referer: "https://live.cctv.cn/", Accept: "application/vnd.apple.mpegurl,application/json,*/*" };
@@ -632,17 +638,17 @@ const THROTTLE_MIN = 45;
 const THROTTLE_MAX = 600;
 const BK_GAP_MS = 250;           // bkliveinfo 接口请求最小间隔 (+ 0~150ms 抖动)
 const BK_JITTER_MS = 150;
-const BK_PREFETCH_MS = 60000;    // bk 地址池满 60 秒即在后台静默预刷新新 Token (早于 atime=120s 过期)
-const BK_URL_TTL = 85000;        // bk 地址池硬有效期 85 秒 (确保始终使用未过期的新 Token 地址)
+const BK_PREFETCH_MS = 45000;    // bk 地址池满 45 秒即在后台静默预刷新新 Token (给 .ts 缓冲与下载留足余量)
+const BK_URL_TTL = 70000;        // bk 地址池硬有效期 70 秒 (确保始终使用未过期的新 Token 地址)
 const BK_TIMEOUT = 2500;         // bk 单次拉取 m3u8 超时 2.5 秒 (超时立即切池内备用地址)
 const STICKY_MS = 600000;
-const FRESH_MAX = 6;
+const FRESH_MAX = 18;
 const REFRESH_AFTER = 1.2;       // 列表超过 1.2 秒即同步刷新拉取新分片
-const SYNC_WAIT_MS = 3800;       // 已有旧缓存时, 同步等待新列表的最长时间 (ms)
+const SYNC_WAIT_MS = 3200;       // 已有旧缓存时, 同步等待新列表的最长时间 (ms)
 const LOW_PLAYLIST_MAX_AGE = 35; // 上游瞬时抖动时旧列表最大兜底秒数(防止偶发超时直接报 503 断连)
 const LOW_IDLE = 45;
 const COLD_WAIT_MS = 10000;
-const P_MAX = 12000;
+const P_MAX = 15000;
 const CU_PEND_MAX = 60000;
 const FETCH_TIMEOUT = 6000;
 
@@ -1006,7 +1012,7 @@ function liveState(ch) {
       mediaBlockedUntil: 0,
       lastError: "", lastErr: null, fails: 0, retryAt: 0,
       inflight: null, inflightAt: 0,
-      bk: { urls: [], t: 0, lastTail: "", lastHost: "", refreshing: false },
+      bk: { urls: [], t: 0, lastTail: "", lastHost: "", lastSeq: -1, refreshing: false },
     };
     LIVE.set(ch.slug, st);
   }
@@ -1264,7 +1270,7 @@ async function fetchBkPool(ch, st) {
   }
   st.bk.urls = urls;
   st.bk.t = Date.now();
-  await sharedPut("bk-" + ch.slug, { urls, t: st.bk.t, lastHost: st.bk.lastHost }, 80);
+  await sharedPut("bk-" + ch.slug, { urls, t: st.bk.t, lastHost: st.bk.lastHost }, 65);
 }
 
 async function ensureBkUrls(ch, st, ctx, forceRefresh = false) {
@@ -1303,18 +1309,29 @@ async function bkRefresh(ch, st, ctx) {
       try {
         const { text, final } = await fetchMediaPlaylist(u, H_BK, 0, BK_TIMEOUT);
         if (!text.includes("#EXTM3U") || !text.includes("#EXTINF")) continue;
+        const seqM = text.match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/);
+        const seq = seqM ? parseInt(seqM[1], 10) : -1;
+        const h = hostOf(u);
+        // 同域名下序号小幅倒退 (1~20) 说明命中了滞后的边缘节点, 保留现有列表不覆盖
+        if (h === st.bk.lastHost && st.bk.lastSeq >= 0 && seq >= 0 && seq < st.bk.lastSeq && st.bk.lastSeq - seq <= 20 && st.playlist && Date.now() / 1000 - st.lastOk < 15) {
+          return;
+        }
         const nowS = Date.now() / 1000;
         const pl = absolutize(text, final);
         const segLines = pl.split(/\r?\n/).filter((l) => l && !l.startsWith("#"));
         const tailSeg = segLines.length ? segLines[segLines.length - 1].split("?")[0] : "";
         const advanced = tailSeg && tailSeg !== st.bk.lastTail;
         st.bk.lastTail = tailSeg;
-        st.bk.lastHost = hostOf(u);
+        st.bk.lastHost = h;
+        st.bk.lastSeq = seq;
         st.playlist = pl;
         st.builtAt = advanced || !st.builtAt ? nowS : Math.max(0, nowS - (REFRESH_AFTER - 0.6));
         st.lastOk = nowS; st.mediaEnd = 0; st.lastError = ""; st.lastErr = null;
         return;
-      } catch (e) { last = errMsg(e); }
+      } catch (e) {
+        last = errMsg(e);
+        if (attempt === 0 && /HTTP (401|403|410)\b/.test(last)) break;
+      }
     }
     if (attempt === 0) {
       try {
@@ -1326,7 +1343,7 @@ async function bkRefresh(ch, st, ctx) {
       }
     }
   }
-  st.bk = { urls: [], t: 0, lastTail: "", lastHost: "", refreshing: false };
+  st.bk = { urls: [], t: 0, lastTail: st.bk.lastTail, lastHost: st.bk.lastHost, lastSeq: st.bk.lastSeq, refreshing: false };
   await sharedDel("bk-" + ch.slug);
   throw new Error(last.slice(0, 120) || "bk playlist failed");
 }
@@ -1483,7 +1500,7 @@ async function handleSegProxy(request, sp) {
         headers: reqHeaders,
         redirect: "follow",
         cf: { cacheTtl: 60, cacheEverything: true },
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(15000),
       });
       if (r.status >= 500 && attempt === 0) continue;
       const resHeaders = new Headers(CORS);
