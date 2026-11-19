@@ -4,7 +4,7 @@ services:
       context: .
       args:
         PY_IMAGE: ${PY_IMAGE:-python:3.12-slim}
-    image: ysp-live-lite:1.1
+    image: ysp-live-lite:1.2
     container_name: ysp-live-lite
     restart: unless-stopped
     init: true            # 让 SIGTERM 正确转发，docker stop 秒退

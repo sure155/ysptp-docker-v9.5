@@ -48,7 +48,7 @@ import uuid
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = 'lite-1.1 (based on ysp-live 9.8)'
+__version__ = 'lite-1.2 (based on ysp-live 9.8)'
 AUTHOR_COMMUNITY = 'https://t.me/garysclub'
 AUTHOR_CHANNEL = 'https://t.me/garysclubchannel'
 
@@ -579,7 +579,7 @@ def bk_playurls(channel_id, live_pid, defn='fhd'):
 
 def fetch_abs_playlist(url, depth=0):
     req = urllib.request.Request(url, headers={'User-Agent': 'qqlive', 'Referer': 'https://live.cctv.cn/', 'Accept': 'application/vnd.apple.mpegurl,application/json,*/*'})
-    with urllib.request.urlopen(req, timeout=10) as r:
+    with urllib.request.urlopen(req, timeout=6) as r:
         text = r.read().decode('utf-8', 'replace')
         final = r.geturl()
     if depth < 2:
@@ -614,9 +614,11 @@ LOGO_BASE = 'https://garysclub.sharewithyou.dpdns.org/logos/ysp-live-logos'
 
 UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36'
 
-REFRESH_INTERVAL = 10
+REFRESH_INTERVAL = 6.0
 
-LOW_STREAM_IDLE_TIMEOUT = 20.0
+BK_REFRESH_INTERVAL = 3.5
+
+LOW_STREAM_IDLE_TIMEOUT = 30.0
 
 LOW_PLAYLIST_MAX_AGE = 30.0
 
@@ -625,6 +627,8 @@ WINDOW = 300
 MAX_SEGS = 120
 
 BK_URL_TTL = 70
+
+BK_PREFETCH_AGE = 45
 
 TIMESHIFT_SUPPORTED = {'cctv1', 'cctv2', 'cctv3', 'cctv4', 'cctv5', 'cctv5p', 'cctv6', 'cctv7', 'cctv8', 'cctv9', 'cctv10', 'cctv13', 'cctv8k', 'cgtn', 'cgtnfr', 'cgtnru', 'cgtnar', 'cgtnes', 'cgtndoc', 'cetv1', 'guoxue', 'bjws', 'jsws', 'dfws', 'zjws', 'hnws', 'hbws', 'gdws', 'gxws', 'hljws', 'hainanws', 'cqws', 'szws', 'scws', 'henanws', 'dnws', 'gzws', 'jxws', 'lnws', 'ahws', 'hebws', 'sdws', 'tjws', 'jlws', 'saxws', 'nxws', 'nmgws', 'ynws', 'shanxiws', 'qhws', 'xizangws', 'xjws', 'gsws'}
 
@@ -740,7 +744,7 @@ def coalesce_refresh(slug: str, refresh_fn, timeout=None):
 
 class ApiFlowLimiter:
 
-    def __init__(self, min_interval_ms: int=700, jitter_ms: int=250):
+    def __init__(self, min_interval_ms: int=250, jitter_ms: int=100):
         self.min_interval = min_interval_ms / 1000.0
         self.jitter = jitter_ms / 1000.0
         self.lock = threading.Lock()
@@ -866,7 +870,9 @@ class Channel:
         self.bk_urls = []
         self.bk_urls_time = 0.0
         self.bk_last_host = ''
+        self.bk_last_seq = -1
         self.bk_playlist = ''
+        self.wake_event = threading.Event()
         self._starting = False
         self.last_built_playlist = ''
         self.last_built_time = 0.0
@@ -1067,13 +1073,30 @@ def jce_refresh(ch):
         ch.last_error = ''
     return True
 
+_MEDIA_SEQ_RE = re.compile(r'^#EXT-X-MEDIA-SEQUENCE:(\d+)', re.M)
+
+def _extract_media_seq(pl: str) -> int:
+    m = _MEDIA_SEQ_RE.search(pl)
+    return int(m.group(1)) if m else -1
+
 def bk_refresh(ch):
-    global_flow_limiter.wait_slot()
     now = time.time()
-    if now - ch.bk_urls_time > BK_URL_TTL or not ch.bk_urls:
+    url_age = now - ch.bk_urls_time
+    if not ch.bk_urls or url_age > BK_URL_TTL:
+        global_flow_limiter.wait_slot()
         ch.bk_urls = bk_playurls(ch.sid, ch.pid, ch.defn)
-        ch.bk_urls_time = now
+        ch.bk_urls_time = time.time()
         log(f'[{ch.slug}] bkliveinfo 通道就绪 ({len(ch.bk_urls)} 地址)', min_interval=60.0)
+    elif url_age > BK_PREFETCH_AGE:
+        # 令牌接近过期前静默续期，失败则继续沿用当前有效地址
+        try:
+            global_flow_limiter.wait_slot()
+            fresh_urls = bk_playurls(ch.sid, ch.pid, ch.defn)
+            if fresh_urls:
+                ch.bk_urls = fresh_urls
+                ch.bk_urls_time = time.time()
+        except Exception:
+            pass
     last_err = ''
     for attempt in range(2):
         candidates = list(ch.bk_urls)
@@ -1084,8 +1107,19 @@ def bk_refresh(ch):
                 pl = fetch_abs_playlist(u)
                 if '#EXTM3U' not in pl:
                     continue
-                ch.bk_last_host = urllib.parse.urlsplit(u).hostname or ''
+                host = urllib.parse.urlsplit(u).hostname or ''
+                seq = _extract_media_seq(pl)
                 with ch.lock:
+                    same_host = (not ch.bk_last_host) or (host == ch.bk_last_host)
+                    # 防止同节点边缘缓存短暂回退 MEDIA-SEQUENCE 导致播放器断流黑屏
+                    if (same_host and seq >= 0 and ch.bk_last_seq >= 0
+                            and seq < ch.bk_last_seq and ch.bk_playlist
+                            and (time.time() - ch.last_ok) < 12.0):
+                        ch.last_error = ''
+                        return True
+                    ch.bk_last_host = host
+                    if seq >= 0:
+                        ch.bk_last_seq = seq
                     ch.bk_playlist = pl
                     ch.last_error = ''
                 return True
@@ -1098,6 +1132,7 @@ def bk_refresh(ch):
                 last_err = '%s: %s' % (type(e).__name__, e)
         if attempt == 0:
             try:
+                global_flow_limiter.wait_slot()
                 ch.bk_urls = bk_playurls(ch.sid, ch.pid, ch.defn)
                 ch.bk_urls_time = time.time()
                 log(f'[{ch.slug}] {defn_label(ch.defn)} 地址已过期，已重新拉取', min_interval=10.0)
@@ -1151,18 +1186,26 @@ def _refresh_once(ch):
         log(f'[{ch.slug}] {defn_label(ch.defn)} 刷新异常: {ch.last_error}', min_interval=15.0)
         return False
 
+def _channel_refresh_interval(ch) -> float:
+    return BK_REFRESH_INTERVAL if ch.mode == 'bk' else REFRESH_INTERVAL
+
 def refresh_loop(ch):
     log(f'[{ch.slug}] {defn_label(ch.defn)} 后台拉取启动 [{ch.mode}]', min_interval=10.0)
     fails = 0
-    if time.time() - ch.last_ok < REFRESH_INTERVAL:
+    interval = _channel_refresh_interval(ch)
+    if time.time() - ch.last_ok < interval:
         build_playlist(ch, holdback=True)
-        time.sleep(REFRESH_INTERVAL)
+        ch.wake_event.wait(timeout=interval)
+        ch.wake_event.clear()
     while time.time() - ch.last_access < LOW_STREAM_IDLE_TIMEOUT:
         ok = refresh_once(ch)
         if ok:
             build_playlist(ch, holdback=True)
         fails = 0 if ok else fails + 1
-        time.sleep(REFRESH_INTERVAL if fails < 3 else 30)
+        interval = _channel_refresh_interval(ch)
+        wait_sec = interval if fails < 3 else min(15.0, interval * 3.0)
+        ch.wake_event.wait(timeout=wait_sec)
+        ch.wake_event.clear()
     log(f'[{ch.slug}] 空闲超时，已停止后台拉取', min_interval=10.0)
 
 def ensure_channel(ch):
@@ -1183,6 +1226,7 @@ def ensure_channel(ch):
                     ch.seen_keys.clear()
                     ch.last_pdt = ''
                     ch.bk_playlist = ''
+                    ch.bk_last_seq = -1
                 need_fetch = True
             else:
                 need_fetch = False
@@ -1242,7 +1286,10 @@ def build_playlist(ch, holdback: bool=True):
 
 def trigger_background_refresh(ch):
     with ch.lock:
-        if ch._starting or (ch.thread is not None and ch.thread.is_alive()):
+        if ch._starting:
+            return
+        if ch.thread is not None and ch.thread.is_alive():
+            ch.wake_event.set()
             return
     with _inflight_lock:
         if ch.slug in _inflight_refresh:
@@ -1586,12 +1633,14 @@ class Handler(BaseHTTPRequestHandler):
         with ch.lock:
             cached_pl = ch.last_built_playlist
             cached_age = now_ts - ch.last_built_time
-        if (cached_pl and cached_age < 15.0
+        swr_max = 3.0 if ch.mode == 'bk' else 8.0
+        swr_bg = 1.8 if ch.mode == 'bk' else 4.0
+        if (cached_pl and cached_age < swr_max
                 and (ch.mode != 'jce' or now_ts - getattr(ch, 'jce_live_media_end', 0) <= 30)
                 and now_ts - ch.last_ok <= LOW_PLAYLIST_MAX_AGE
                 and '#EXTM3U' in cached_pl):
             self._send_playlist(cached_pl, head_only, {'X-SWR': 'HIT'})
-            if cached_age > 6.0:
+            if cached_age > swr_bg:
                 trigger_background_refresh(ch)
             return
 
