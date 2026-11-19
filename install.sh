@@ -1,1 +1,19 @@
-#!/bin/bash\n# One-click install for ysp-live-lite\n\n# 1. Update and install Docker\nyum update -y && yum install -y docker && systemctl start docker && systemctl enable docker\n\n# 2. Create and mount data volume (not needed for this version, skip)\n# mkdir -p /opt/ysp-live-lite\n\n# 3. Pull and run\ndocker run -d --name ysp-live-lite --restart unless-stopped -p 8767:8767 -e YSP_TOKEN=$(openssl rand -hex 4) sure155/ysp-live-lite:latest\n\n# 4. Generate subscription URL\necho "Subscription URL: http://$(hostname -I | awk {print }):8767/$(docker exec ysp-live-lite cat /app/.env | grep YSP_TOKEN | cut -d= -f2)/all.m3u"
+#!/bin/bash
+# One-click install for ysp-live-lite (Debian)
+
+# 1. 更新源并安装 Docker 与 openssl
+apt-get update && apt-get install -y docker.io openssl
+systemctl start docker && systemctl enable docker
+
+# 2. 生成随机 Token
+TOKEN=$(openssl rand -hex 4)
+
+# 3. 拉取并运行容器
+docker run -d --name ysp-live-lite --restart unless-stopped \
+  -p 8767:8767 \
+  -e YSP_TOKEN="$TOKEN" \
+  sure155/ysp-live-lite:latest
+
+# 4. 输出订阅地址
+IP=$(hostname -I | awk '{print $1}')
+echo "Subscription URL: http://${IP}:8767/${TOKEN}/all.m3u"
