@@ -121,79 +121,74 @@ location / {
 - 开发环境无法访问央视上游，**没有做真实频道的播放验证**。已做的验证：① 本地模拟 CDN 的端到端测试（`python3 tests/test_lite.py`，约 63 项：口令、直连/中转、Range、重定向、SSRF 防护、keep-alive、并发、SIGTERM 等全部通过）；② 与原版协议层逐字节对比一致。
 - 没有 Docker 环境，Dockerfile / compose 只做了语法校验，**没有实际 `docker build`**。如构建报错请把日志发给我。
 - 上游是否放行你的 VPS、各频道此刻是否可用、流畅度如何，取决于上游和网络，无法承诺。
-## Cloudflare Worker 部署（可选，用于域名 + HTTPS）
+## Cloudflare Worker 独立部署（可选，无需 VPS）
 
-如果你有 Cloudflare 账号，可以使用 Worker 来：
+如果你有 Cloudflare 账号，可以直接将 `cf-worker-ysp-live.js` 部署到 Cloudflare Workers，**完全在 Worker 上运行**，无需任何 VPS：
 
-1. **统一域名访问**：
-2. **启用 HTTPS**：避免浏览器拦截 HTTP 分片
-3. **隐藏 VPS IP**：外部只看到 Cloudflare 域名
+1. **直播/回看/EPG 全在 Worker 内完成**（JCE/BK 协议、回看拼接、EPG 多源回退、分片代理）
+2. **生成可直接播放的订阅链接**（`/all.m3u`、单频道 `.m3u8`、EPG、分片代理 `/seg`）
+3. **隐藏源站 IP**，仅暴露 Worker 域名
+4. **自动 HTTPS**，避免浏览器拦截 HTTP 分片
 
-### 步骤
-
-#### 1. 准备 Worker 脚本
-
-编辑 ，将  替换为你的 VPS IP：
-
-```javascript
-// CF Worker proxy script for ysp-live-lite
-addEventListener('fetch', event => {
-  event.respondWith(handleRequest(event.request));
-});
-
-async function handleRequest(request) {
-  const url = new URL(request.url);
-  const token = url.pathname.split('/')[1];
-  const targetUrl = `http://你的VPS_IP:8767/${token}${url.pathname.replace(`/${token}`, '')}${url.search}`;
-  const newRequest = new Request(targetUrl, request);
-  return fetch(newRequest);
-}
-```
-
-#### 2. 部署到 Cloudflare
+### 部署步骤
 
 1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com)
 2. 进入 **Workers & Pages** → **Create Application** → **Create Worker**
-3. 将  的内容粘贴到编辑器
+3. 将 `cf-worker-ysp-live.js` 的全部内容粘贴到编辑器
 4. 点击 **Deploy** → **Save and Deploy**
-5. 获取 Worker URL（如 ）
+5. 获取 Worker URL（如 `https://ysp-live.xxx.workers.dev`）
 
-#### 3. 配置域名（可选）
+### 环境变量（在 Worker 设置 → Variables 中配置，均可选）
 
-在 Cloudflare DNS 中添加 A 记录：
-- **类型**: A
-- **名称**: tv
-- **内容**: 你的 VPS IP
+| 变量 | 说明 |
+|------|------|
+| `TOKEN` | 访问口令，设置后所有路径（除 `/` 和 `/favicon.ico`）需带 `?token=xxx` |
+| `LIVE_MODE` | `auto`(默认) \| `bk` \| `jce` — 直播模式选择 |
+| `PROXY_TS` | 设为 `1` 时默认通过 Worker 代理 `.ts` 分片 |
+| `NATIVE_GZIP` | 设为 `1` 时 JCE 请求用 `CompressionStream` 压缩 |
+| `GUID` | 32 位 hex 固定设备 ID（不设则每个 isolate 随机生成） |
+| `CATCHUP_TZ` | 回看时间时区，默认 `+08:00`，可填 `utc` / `Asia/Shanghai` / `auto` |
+| `CATCHUP_MAX` | 单次回看最长跨度(秒)，默认 `14400` (4h) |
+| `PDT_OVERLAP_MAX` | 容许相邻分片 PDT 重叠最大秒数，默认 `1.2` |
+
+### 访问地址（部署后直接可用）
+
+```
+# 通用订阅 (TVBox / 影视仓 / APTV / IPTVnator 等)
+https://<your-worker>.workers.dev/all.m3u?token=<TOKEN>
+
+# 分片代理订阅（直连 CDN 偶发黑屏/断连时推荐）
+https://<your-worker>.workers.dev/all.m3u?token=<TOKEN>&proxy=1
+
+# ynoTV / TiviMate / Kodi (UTC 模式回看)
+https://<your-worker>.workers.dev/all.m3u?token=<TOKEN>&mode=utc
+
+# 单频道
+https://<your-worker>.workers.dev/cctv1.m3u8?token=<TOKEN>
+
+# EPG
+https://<your-worker>.workers.dev/epg.xml?token=<TOKEN>
+
+# 健康检查 / 诊断
+https://<your-worker>.workers.dev/health?token=<TOKEN>
+https://<your-worker>.workers.dev/cctv1.m3u8?token=<TOKEN>&debug=1&probe=1
+```
+
+### 自定义域名（可选）
+
+在 Cloudflare DNS 添加 CNAME：
+- **类型**: CNAME
+- **名称**: tv (或任意子域名)
+- **目标**: `<your-worker>.workers.dev`
 - **代理状态**: 已代理（橙色云）
 
-然后在 Worker 设置中配置 **Routes**：
--  → 
-
-#### 4. 更新 VPS 配置
-
-在 VPS 的  文件中添加：
-
-```bash
-HOST_BIND=127.0.0.1
-YSP_PUBLIC_URL=https://tv.example.com
-```
-
-重启容器：
-
-```bash
-docker compose restart
-```
-
-### 完整访问地址
-
-- **通过 Worker**: 
-- **直接访问 VPS**: 
+然后在 Worker 设置 → Triggers → **Add Custom Domain** 绑定该域名。
 
 ### 注意事项
 
-1. Worker 脚本默认转发到 VPS，建议配合反向代理（Caddy/Nginx）使用
-2. Worker 免费版有 100,000 次/天请求限制，ysp-live-lite 低码模式几乎不耗流量，通常足够
-3. 如果 VPS IP 被央视封禁，Worker 可以通过不同出口 IP 绕过
+1. Worker 免费版每天 100,000 次请求，ysp-live 低码模式几乎不耗流量，通常足够
+2. 如果需要更高并发或长时间回看，可考虑 Workers Paid Plan ($5/月，1000万次/天)
+3. 源站 IP 完全不暴露，仅 Worker 域名对外
 
 
 ## 验证与局限（请知悉）
