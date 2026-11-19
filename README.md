@@ -113,4 +113,79 @@ location / {
 - 开发环境无法访问央视上游，**没有做真实频道的播放验证**。已做的验证：① 本地模拟 CDN 的端到端测试（`python3 tests/test_lite.py`，约 63 项：口令、直连/中转、Range、重定向、SSRF 防护、keep-alive、并发、SIGTERM 等全部通过）；② 与原版协议层逐字节对比一致。
 - 没有 Docker 环境，Dockerfile / compose 只做了语法校验，**没有实际 `docker build`**。如构建报错请把日志发给我。
 - 上游是否放行你的 VPS、各频道此刻是否可用、流畅度如何，取决于上游和网络，无法承诺。
-- 访问口令放在 URL 路径里，请配合 https 使用，不要把完整订阅地址发给别人或贴到日志 / 截图里。
+## Cloudflare Worker 部署（可选，用于域名 + HTTPS）
+
+如果你有 Cloudflare 账号，可以使用 Worker 来：
+
+1. **统一域名访问**：
+2. **启用 HTTPS**：避免浏览器拦截 HTTP 分片
+3. **隐藏 VPS IP**：外部只看到 Cloudflare 域名
+
+### 步骤
+
+#### 1. 准备 Worker 脚本
+
+编辑 ，将  替换为你的 VPS IP：
+
+```javascript
+// CF Worker proxy script for ysp-live-lite
+addEventListener('fetch', event => {
+  event.respondWith(handleRequest(event.request));
+});
+
+async function handleRequest(request) {
+  const url = new URL(request.url);
+  const token = url.pathname.split('/')[1];
+  const targetUrl = `http://你的VPS_IP:8767/${token}${url.pathname.replace(`/${token}`, '')}${url.search}`;
+  const newRequest = new Request(targetUrl, request);
+  return fetch(newRequest);
+}
+```
+
+#### 2. 部署到 Cloudflare
+
+1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com)
+2. 进入 **Workers & Pages** → **Create Application** → **Create Worker**
+3. 将  的内容粘贴到编辑器
+4. 点击 **Deploy** → **Save and Deploy**
+5. 获取 Worker URL（如 ）
+
+#### 3. 配置域名（可选）
+
+在 Cloudflare DNS 中添加 A 记录：
+- **类型**: A
+- **名称**: tv
+- **内容**: 你的 VPS IP
+- **代理状态**: 已代理（橙色云）
+
+然后在 Worker 设置中配置 **Routes**：
+-  → 
+
+#### 4. 更新 VPS 配置
+
+在 VPS 的  文件中添加：
+
+```bash
+HOST_BIND=127.0.0.1
+YSP_PUBLIC_URL=https://tv.example.com
+```
+
+重启容器：
+
+```bash
+docker compose restart
+```
+
+### 完整访问地址
+
+- **通过 Worker**: 
+- **直接访问 VPS**: 
+
+### 注意事项
+
+1. Worker 脚本默认转发到 VPS，建议配合反向代理（Caddy/Nginx）使用
+2. Worker 免费版有 100,000 次/天请求限制，ysp-live-lite 低码模式几乎不耗流量，通常足够
+3. 如果 VPS IP 被央视封禁，Worker 可以通过不同出口 IP 绕过
+
+
+## 验证与局限（请知悉）
