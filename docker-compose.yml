@@ -4,7 +4,7 @@ services:
       context: .
       args:
         PY_IMAGE: ${PY_IMAGE:-python:3.12-slim}
-    image: ysp-live-lite:1.0
+    image: ysp-live-lite:1.1
     container_name: ysp-live-lite
     restart: unless-stopped
     init: true            # 让 SIGTERM 正确转发，docker stop 秒退
@@ -17,6 +17,9 @@ services:
       YSP_PUBLIC_URL: ${YSP_PUBLIC_URL:-}
       YSP_PROXY_SEGMENTS: ${YSP_PROXY_SEGMENTS:-0}
       YSP_CACHE_MB: ${YSP_CACHE_MB:-64}
+      YSP_PRIMARY_MODE: ${YSP_PRIMARY_MODE:-bk}
+      YSP_FORCE_IPV4: ${YSP_FORCE_IPV4:-0}
+      YSP_UPSTREAM_PROXY: ${YSP_UPSTREAM_PROXY:-}
       YSP_SEG_ALLOW_EXTRA: ${YSP_SEG_ALLOW_EXTRA:-}
       YSP_EXCLUDE_CHANNELS: ${YSP_EXCLUDE_CHANNELS:-}
     # 无状态服务，不需要数据卷；根文件系统只读

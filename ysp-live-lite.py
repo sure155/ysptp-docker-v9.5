@@ -48,10 +48,7 @@ import uuid
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# 不读取 HTTP(S)_PROXY 等环境代理，保持与原版一致
-urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
-
-__version__ = 'lite-1.0 (based on ysp-live 9.8)'
+__version__ = 'lite-1.1 (based on ysp-live 9.8)'
 AUTHOR_COMMUNITY = 'https://t.me/garysclub'
 AUTHOR_CHANNEL = 'https://t.me/garysclubchannel'
 
@@ -82,6 +79,26 @@ PROXY_SEGMENTS = _env_bool('YSP_PROXY_SEGMENTS', False)
 CACHE_MB = _env_int('YSP_CACHE_MB', 64, 0, 2048)
 SEG_ALLOW_EXTRA = tuple(s if s.startswith('.') else '.' + s for s in _env_list('YSP_SEG_ALLOW_EXTRA'))
 EXCLUDE_CHANNELS = set(_env_list('YSP_EXCLUDE_CHANNELS'))
+PRIMARY_MODE = os.environ.get('YSP_PRIMARY_MODE', 'bk').strip().lower()
+if PRIMARY_MODE not in ('bk', 'jce'):
+    PRIMARY_MODE = 'bk'
+UPSTREAM_PROXY = os.environ.get('YSP_UPSTREAM_PROXY', '').strip()
+FORCE_IPV4 = _env_bool('YSP_FORCE_IPV4', False)
+
+if UPSTREAM_PROXY:
+    urllib.request.install_opener(urllib.request.build_opener(
+        urllib.request.ProxyHandler({'http': UPSTREAM_PROXY, 'https': UPSTREAM_PROXY})))
+else:
+    # 默认不读取 HTTP(S)_PROXY 等环境代理，保持与原版一致
+    urllib.request.install_opener(urllib.request.build_opener(urllib.request.ProxyHandler({})))
+
+if FORCE_IPV4:
+    _orig_getaddrinfo = socket.getaddrinfo
+    def _ipv4_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        if family in (0, socket.AF_UNSPEC):
+            family = socket.AF_INET
+        return _orig_getaddrinfo(host, port, family, type, proto, flags)
+    socket.getaddrinfo = _ipv4_getaddrinfo
 
 server_port: int = 8767
 server_start_time = time.time()
@@ -447,7 +464,7 @@ def _jce_timeshift_url(pid, sid, start, end, stream='fhd'):
     packet = _wrap(CMD, body, reqid)
     req = urllib.request.Request('https://jacc.ysp.cctv.cn', data=packet, method='POST')
     req.add_header('Content-Type', 'application/octet-stream')
-    with urllib.request.urlopen(req, timeout=15) as resp:
+    with urllib.request.urlopen(req, timeout=8) as resp:
         raw = resp.read()
     resp_body = _unwrap(raw)
     if not resp_body:
@@ -541,7 +558,7 @@ def bk_playurls(channel_id, live_pid, defn='fhd'):
     t = _ckey(channel_id)
     q = urllib.parse.urlencode({'atime': '120', 'livepid': live_pid, 'cnlid': channel_id, 'appVer': _CK_APPVER, 'app_version': '300090', 'caplv': '1', 'cmd': '2', 'defn': defn, 'device': 'iPhone', 'encryptVer': '4.2', 'getpreviewinfo': '0', 'hevclv': '0', 'lang': 'zh-Hans_CN', 'livequeue': '0', 'logintype': '1', 'nettype': '1', 'newnettype': '1', 'newplatform': str(_CK_PLATFORM), 'platform': str(_CK_PLATFORM), 'sdtfrom': 'v3021', 'spacode': '23', 'spaudio': '1', 'spdemuxer': '6', 'spdrm': '2', 'spdynamicrange': '1', 'spflv': '1', 'spflvaudio': '1', 'sphdrfps': '60', 'sphttps': '1', 'spvcode': _BK_H264, 'spvideo': '4', 'stream': '1', 'system': '1', 'sysver': 'ios18.2.1', 'uhd_flag': '0', 'cKey': t['cKey'], 'guid': t['guid'], 'fntick': str(t['ts']), 'flowid': t['flowId'], 'playbacktime': '0'})
     req = urllib.request.Request('https://bkliveinfo.ysp.cctv.cn/?' + q, headers={'User-Agent': 'qqlive', 'Accept': 'application/json'})
-    with urllib.request.urlopen(req, timeout=5) as r:
+    with urllib.request.urlopen(req, timeout=8) as r:
         p = json.loads(r.read().decode())
     if int(p.get('iretcode', -1)) != 0:
         raise RuntimeError('iretcode=%s %s' % (p.get('iretcode'), p.get('errinfo', '')))
@@ -554,10 +571,10 @@ def bk_playurls(channel_id, live_pid, defn='fhd'):
             urls.append(it if isinstance(it, str) else it.get('url') or it.get('playurl') or '')
     elif isinstance(bu, str):
         urls += [x for x in re.split('[;,]', bu) if x.strip()]
-    urls = [u for u in dict.fromkeys(urls) if u and '.cctv.' in u]
+    urls = [u.strip() for u in dict.fromkeys(urls) if isinstance(u, str) and u.strip().startswith(('http://', 'https://'))]
     if not urls:
         raise RuntimeError('no playurl')
-    urls.sort(key=lambda u: (0 if 'bklive-' in u else 1, u))
+    urls.sort(key=lambda u: (0 if 'bklive-' in u else (1 if '.cctv.' in u else 2), u))
     return urls
 
 def fetch_abs_playlist(url, depth=0):
@@ -607,7 +624,7 @@ WINDOW = 300
 
 MAX_SEGS = 120
 
-BK_URL_TTL = 300
+BK_URL_TTL = 70
 
 TIMESHIFT_SUPPORTED = {'cctv1', 'cctv2', 'cctv3', 'cctv4', 'cctv5', 'cctv5p', 'cctv6', 'cctv7', 'cctv8', 'cctv9', 'cctv10', 'cctv13', 'cctv8k', 'cgtn', 'cgtnfr', 'cgtnru', 'cgtnar', 'cgtnes', 'cgtndoc', 'cetv1', 'guoxue', 'bjws', 'jsws', 'dfws', 'zjws', 'hnws', 'hbws', 'gdws', 'gxws', 'hljws', 'hainanws', 'cqws', 'szws', 'scws', 'henanws', 'dnws', 'gzws', 'jxws', 'lnws', 'ahws', 'hebws', 'sdws', 'tjws', 'jlws', 'saxws', 'nxws', 'nmgws', 'ynws', 'shanxiws', 'qhws', 'xizangws', 'xjws', 'gsws'}
 
@@ -844,10 +861,11 @@ class Channel:
         self.thread = None
         self.last_error = ''
         self.last_ok = 0.0
-        self.mode = 'jce'
+        self.mode = PRIMARY_MODE
         self.last_pdt = ''
         self.bk_urls = []
         self.bk_urls_time = 0.0
+        self.bk_last_host = ''
         self.bk_playlist = ''
         self._starting = False
         self.last_built_playlist = ''
@@ -864,7 +882,7 @@ def jce_note_access(ch, now):
         try:
             with ch.lock:
                 if now - ch.last_access >= LOW_STREAM_IDLE_TIMEOUT:
-                    for key in ('jce_live_tail', 'jce_live_rows', 'jce_target', 'jce_accepted_generation', 'jce_sequence_offset', 'jce_live_playlist', 'jce_live_media_end', 'jce_suppress_pdt'):
+                    for key in ('jce_live_url', 'jce_live_expiry', 'jce_live_tail', 'jce_live_rows', 'jce_target', 'jce_accepted_generation', 'jce_sequence_offset', 'jce_live_playlist', 'jce_live_media_end', 'jce_suppress_pdt'):
                         if hasattr(ch, key):
                             delattr(ch, key)
                     ch.last_built_playlist = ''
@@ -879,7 +897,7 @@ def parse_jce_live_window(text, base_url, now, with_target=False):
     lines = [x.strip() for x in text.splitlines() if x.strip()]
     if not lines or lines[0] != '#EXTM3U':
         raise RuntimeError('JCE invalid media playlist')
-    allowed = ('#EXTM3U', '#EXT-X-VERSION:', '#EXT-X-TARGETDURATION:', '#EXT-X-MEDIA-SEQUENCE:', '#EXT-X-PROGRAM-DATE-TIME:', '#EXTINF:', '#EXT-X-ENDLIST', '#EXT-X-PLAYLIST-TYPE:')
+    allowed = ('#EXTM3U', '#EXT-X-VERSION:', '#EXT-X-TARGETDURATION:', '#EXT-X-MEDIA-SEQUENCE:', '#EXT-X-PROGRAM-DATE-TIME:', '#EXTINF:', '#EXT-X-ENDLIST', '#EXT-X-PLAYLIST-TYPE:', '#EXT-X-INDEPENDENT-SEGMENTS', '#EXT-X-DISCONTINUITY-SEQUENCE:', '#EXT-X-ALLOW-CACHE:', '#EXT-X-START:', '#EXT-X-DISCONTINUITY')
     seq, duration, stamp, rows = (0, None, None, [])
     target = None
     previous_end = None
@@ -955,7 +973,7 @@ def jce_fetch(ch):
         ch.jce_anchor_generation = getattr(ch, 'jce_anchor_generation', 0) + 1
     req = urllib.request.Request(ch.jce_live_url, headers={'User-Agent': UA})
     try:
-        with urllib.request.urlopen(req, timeout=20) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             raw = response.read(2 * 1024 * 1024 + 1)
             if len(raw) > 2 * 1024 * 1024:
                 raise RuntimeError('JCE playlist too large')
@@ -978,21 +996,32 @@ def jce_fetch(ch):
                 delay = 60.0
             ch.jce_media_blocked_until = time.time() + delay
             raise JceRateLimited('JCE media cooldown') from exc
+        ch.jce_live_url = ''
+        ch.jce_live_expiry = 0
         raise
-    rows, target = parse_jce_live_window(text, media_base, time.time(), with_target=True)
-    if getattr(ch, 'jce_target', target) != target:
-        raise RuntimeError('JCE target duration changed; reopen required')
-    ch.jce_pending_target = target
-    offset = getattr(ch, 'jce_sequence_offset', 0)
-    if getattr(ch, 'jce_accepted_generation', 0) != ch.jce_anchor_generation:
-        old = getattr(ch, 'jce_live_rows', {})
-        if old:
-            offsets = {oldseq - seq for seq, stamp, duration, url in rows for oldseq, (oldstamp, oldduration) in old.items() if abs(stamp - oldstamp) < 0.05 and abs(duration - oldduration) < 0.05}
-            if len(offsets) != 1:
-                raise RuntimeError('JCE new window lacks unambiguous PDT overlap; reopen required')
-            offset = offsets.pop()
-        else:
-            offset = 0
+    except Exception:
+        ch.jce_live_url = ''
+        ch.jce_live_expiry = 0
+        raise
+    try:
+        rows, target = parse_jce_live_window(text, media_base, time.time(), with_target=True)
+        if getattr(ch, 'jce_target', target) != target:
+            raise RuntimeError('JCE target duration changed; reopen required')
+        ch.jce_pending_target = target
+        offset = getattr(ch, 'jce_sequence_offset', 0)
+        if getattr(ch, 'jce_accepted_generation', 0) != ch.jce_anchor_generation:
+            old = getattr(ch, 'jce_live_rows', {})
+            if old:
+                offsets = {oldseq - seq for seq, stamp, duration, url in rows for oldseq, (oldstamp, oldduration) in old.items() if abs(stamp - oldstamp) < 0.05 and abs(duration - oldduration) < 0.05}
+                if len(offsets) != 1:
+                    raise RuntimeError('JCE new window lacks unambiguous PDT overlap; reopen required')
+                offset = offsets.pop()
+            else:
+                offset = 0
+    except Exception:
+        ch.jce_live_url = ''
+        ch.jce_live_expiry = 0
+        raise
     rows = [(seq + offset, stamp, duration, url) for seq, stamp, duration, url in rows]
     previous = getattr(ch, 'jce_live_tail', None)
     tail = rows[-1]
@@ -1044,20 +1073,26 @@ def bk_refresh(ch):
     if now - ch.bk_urls_time > BK_URL_TTL or not ch.bk_urls:
         ch.bk_urls = bk_playurls(ch.sid, ch.pid, ch.defn)
         ch.bk_urls_time = now
-        log(f'[{ch.slug}] bkliveinfo 备用通道就绪 ({len(ch.bk_urls)} 地址)', min_interval=60.0)
+        log(f'[{ch.slug}] bkliveinfo 通道就绪 ({len(ch.bk_urls)} 地址)', min_interval=60.0)
     last_err = ''
     for attempt in range(2):
-        for u in list(ch.bk_urls):
+        candidates = list(ch.bk_urls)
+        if ch.bk_last_host:
+            candidates.sort(key=lambda u: 0 if urllib.parse.urlsplit(u).hostname == ch.bk_last_host else 1)
+        for u in candidates:
             try:
                 pl = fetch_abs_playlist(u)
                 if '#EXTM3U' not in pl:
                     continue
+                ch.bk_last_host = urllib.parse.urlsplit(u).hostname or ''
                 with ch.lock:
                     ch.bk_playlist = pl
                     ch.last_error = ''
                 return True
             except urllib.error.HTTPError as e:
                 last_err = 'HTTPError: HTTP %s' % e.code
+                if e.code in (401, 403, 410) and attempt == 0:
+                    break
                 continue
             except Exception as e:
                 last_err = '%s: %s' % (type(e).__name__, e)
@@ -1066,8 +1101,8 @@ def bk_refresh(ch):
                 ch.bk_urls = bk_playurls(ch.sid, ch.pid, ch.defn)
                 ch.bk_urls_time = time.time()
                 log(f'[{ch.slug}] {defn_label(ch.defn)} 地址已过期，已重新拉取', min_interval=10.0)
-            except Exception:
-                pass
+            except Exception as e:
+                last_err = '%s: %s' % (type(e).__name__, e)
     ch.bk_urls = []
     ch.bk_urls_time = 0
     raise RuntimeError(last_err[:120] or 'bk playlist failed')
@@ -1083,19 +1118,36 @@ def refresh_once(ch):
 def _refresh_once(ch):
     try:
         if ch.mode == 'bk':
-            ok = bk_refresh(ch)
+            try:
+                ok = bk_refresh(ch)
+            except Exception as bk_err:
+                if ch.slug not in FORCE_BK and jce_request_gate.remaining() <= 0:
+                    log(f'[{ch.slug}] bkliveinfo 失败 ({type(bk_err).__name__}: {bk_err})，尝试切换 JCE 备用通道', min_interval=15.0)
+                    try:
+                        ok = jce_refresh(ch)
+                        if ok:
+                            ch.mode = 'jce'
+                    except Exception as jce_err:
+                        raise RuntimeError('bk: %s; jce: %s' % (bk_err, jce_err)) from jce_err
+                else:
+                    raise
         else:
             try:
                 ok = jce_refresh(ch)
-            except DeadHostError:
-                ch.mode = 'bk'
-                log(f'[{ch.slug}] JCE 域名受限，自动切换 bkliveinfo 备用通道', min_interval=10.0)
-                ok = bk_refresh(ch)
+            except Exception as jce_err:
+                reason = '域名受限' if isinstance(jce_err, DeadHostError) else ('%s: %s' % (type(jce_err).__name__, jce_err))
+                log(f'[{ch.slug}] JCE 失败 ({reason})，自动切换 bkliveinfo 备用通道', min_interval=10.0)
+                try:
+                    ok = bk_refresh(ch)
+                    if ok:
+                        ch.mode = 'bk'
+                except Exception as bk_err:
+                    raise RuntimeError('jce: %s; bk: %s' % (jce_err, bk_err)) from bk_err
         if ok:
             ch.last_ok = time.time()
         return ok
     except Exception as e:
-        ch.last_error = ('%s: %s' % (type(e).__name__, e))[:120]
+        ch.last_error = ('%s: %s' % (type(e).__name__, e))[:180]
         log(f'[{ch.slug}] {defn_label(ch.defn)} 刷新异常: {ch.last_error}', min_interval=15.0)
         return False
 
@@ -1122,13 +1174,15 @@ def ensure_channel(ch):
             wait_only = True
         else:
             thread_dead = ch.thread is None or not ch.thread.is_alive()
-            cache_stale = now - ch.last_ok > LOW_PLAYLIST_MAX_AGE or (not ch.segments and (not ch.bk_playlist))
-            if cache_stale and thread_dead:
-                ch.segments.clear()
-                ch.order.clear()
-                ch.seen_keys.clear()
-                ch.last_pdt = ''
-                ch.bk_playlist = ''
+            has_pl = bool(ch.bk_playlist) if ch.mode == 'bk' else bool(getattr(ch, 'jce_live_playlist', '') or ch.segments)
+            cache_stale = now - ch.last_ok > LOW_PLAYLIST_MAX_AGE or not has_pl
+            if cache_stale:
+                if thread_dead:
+                    ch.segments.clear()
+                    ch.order.clear()
+                    ch.seen_keys.clear()
+                    ch.last_pdt = ''
+                    ch.bk_playlist = ''
                 need_fetch = True
             else:
                 need_fetch = False
@@ -1137,11 +1191,11 @@ def ensure_channel(ch):
             else:
                 return
     if wait_only:
-        coalesce_refresh(ch.slug, lambda: refresh_once(ch), timeout=5.0)
+        coalesce_refresh(ch.slug, lambda: refresh_once(ch), timeout=15.0)
         return
     try:
         if need_fetch:
-            coalesce_refresh(ch.slug, lambda: refresh_once(ch), timeout=5.0)
+            coalesce_refresh(ch.slug, lambda: refresh_once(ch), timeout=15.0)
         if thread_dead:
             ch.thread = threading.Thread(target=refresh_loop, args=(ch,), daemon=True)
             ch.thread.start()
@@ -1324,7 +1378,7 @@ def open_upstream(url: str, range_header: str, head_only: bool):
             conn = http.client.HTTPConnection(p.hostname, port, timeout=15)
         try:
             target = (p.path or '/') + ('?' + p.query if p.query else '')
-            headers = {'User-Agent': UA, 'Accept': '*/*', 'Accept-Encoding': 'identity', 'Connection': 'close'}
+            headers = {'User-Agent': UA, 'Referer': 'https://live.cctv.cn/', 'Accept': '*/*', 'Accept-Encoding': 'identity', 'Connection': 'close'}
             if range_header:
                 headers['Range'] = range_header
             conn.request('HEAD' if head_only else 'GET', target, headers=headers)
@@ -1470,6 +1524,7 @@ class Handler(BaseHTTPRequestHandler):
             'ok': True,
             'version': __version__,
             'mode': 'low-bitrate-only',
+            'primary_mode': PRIMARY_MODE,
             'uptime_sec': int(time.time() - server_start_time),
             'channels': len(global_channel_dir.unique_channels()),
             'proxy_segments': PROXY_SEGMENTS,
@@ -1486,6 +1541,7 @@ class Handler(BaseHTTPRequestHandler):
             'ysp-live-lite %s 诊断报告 (运行时间: %ds)' % (__version__, int(now - server_start_time)),
             "基于 Gary's Club ysp-live 9.8 改造 · 原作者社区: %s" % AUTHOR_COMMUNITY,
             '====================================================',
+            '主取流通道: %s (失败自动切换备用通道)' % PRIMARY_MODE,
             '分片模式: %s' % ('VPS 中转 (YSP_PROXY_SEGMENTS=1)' if PROXY_SEGMENTS else '客户端直连 CDN'),
             'JCE 限流冷却: %s' % ('剩余 %d 秒' % int(math.ceil(gate)) if gate > 0 else '无'),
         ]
@@ -1543,6 +1599,8 @@ class Handler(BaseHTTPRequestHandler):
         pl = build_playlist(ch, holdback=True)
         if pl and '#EXTM3U' in pl:
             return self._send_playlist(pl, head_only)
+        if cached_pl and cached_age < LOW_PLAYLIST_MAX_AGE * 2 and '#EXTM3U' in cached_pl:
+            return self._send_playlist(cached_pl, head_only, {'X-SWR': 'STALE'})
         if ch.mode == 'jce':
             retry = max(jce_request_gate.remaining(), getattr(ch, 'jce_media_blocked_until', 0) - time.time())
             if retry > 0:
@@ -1677,8 +1735,8 @@ def main():
     total = len(global_channel_dir.unique_channels())
     cctv = len([c for c in global_channel_dir.unique_channels() if c['group'] == '央视'])
     log('=' * 68)
-    log('ysp-live-lite %s 启动成功: %d 个频道 (央视 %d 路, 卫视 %d 路) · 仅低码率路径 (JCE → bkliveinfo)' % (
-        __version__, total, cctv, total - cctv))
+    log('ysp-live-lite %s 启动成功: %d 个频道 (央视 %d 路, 卫视 %d 路) · 低码率路径 (主通道: %s，失败自动切换备用)' % (
+        __version__, total, cctv, total - cctv, PRIMARY_MODE))
     log('监听 %s:%d · 分片模式: %s · 缓存 %dMB' % (
         args.bind, args.port, 'VPS 中转' if PROXY_SEGMENTS else '客户端直连 CDN', CACHE_MB if PROXY_SEGMENTS else 0))
     log('订阅地址: %s/all.m3u' % ('http://<你的地址>:%d/<YSP_TOKEN>' % args.port if TOKEN else 'http://<你的地址>:%d' % args.port))
