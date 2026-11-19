@@ -1,21 +1,35 @@
 services:
   ysp-live:
-    image: ysp-live:9.5
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: ysp-live-v9.5
+      args:
+        PY_IMAGE: ${PY_IMAGE:-python:3.12-slim}
+    image: ysp-live-lite:1.0
+    container_name: ysp-live-lite
     restart: unless-stopped
+    init: true            # 让 SIGTERM 正确转发，docker stop 秒退
     ports:
-      - "8767:8767"
-    volumes:
-      - ./data:/app/data
+      # 走 Caddy/Nginx 反代时，在 .env 里设 HOST_BIND=127.0.0.1，只对本机开放
+      - "${HOST_BIND:-0.0.0.0}:${HOST_PORT:-8767}:8767"
     environment:
-      - TZ=Asia/Shanghai
-      - PYTHONUNBUFFERED=1
-      - YSP_DATA_DIR=/app/data
+      TZ: Asia/Shanghai
+      YSP_TOKEN: ${YSP_TOKEN:?请先 cp .env.example .env，并把 YSP_TOKEN 设置为随机串（openssl rand -hex 16）}
+      YSP_PUBLIC_URL: ${YSP_PUBLIC_URL:-}
+      YSP_PROXY_SEGMENTS: ${YSP_PROXY_SEGMENTS:-0}
+      YSP_CACHE_MB: ${YSP_CACHE_MB:-64}
+      YSP_SEG_ALLOW_EXTRA: ${YSP_SEG_ALLOW_EXTRA:-}
+      YSP_EXCLUDE_CHANNELS: ${YSP_EXCLUDE_CHANNELS:-}
+    # 无状态服务，不需要数据卷；根文件系统只读
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 384m
     logging:
-      driver: "json-file"
+      driver: json-file
       options:
         max-size: "10m"
         max-file: "3"

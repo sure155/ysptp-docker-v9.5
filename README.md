@@ -80,64 +80,79 @@
 
 > **EPG 节目单显示说明**：**仅 ynoTV 需加 `?mode=utc`**（回看改用 `utc={utc}&lutc={lutc}` 时间戳，与时区无关）才能正确显示节目单；vstv、TiviMate、Kodi、国产软件直接订阅通用链接即可正常显示节目单。
 
----
-## 🛠 VPS 优化参数
+## 🛠 特性对比
 
-| 参数 | 值 | 说明 |
-|------|-----|------|
-| `WINDOW` | 1800 | 时移窗口（秒） |
-| `MAX_SEGS` | 400 | 最大缓冲区片段数 |
-| `init_segs` | 400 | 初始缓冲片段数 |
-| `--no-4k` | — | 跳过 4K 设备协议注册 |
+| | 原版 v9.5 | 本版 (lite) |
+|--|---|---|
+| 高码率 / 4K 设备协议（设备注册、AES-GCM/RSA 会话） | 有 | **已删除** |
+| Node.js「Web WASM 伴生引擎」、`/engine_proxy`、`?k4=1` | 有 | **已删除**（镜像不再含 Node） |
+| 低码率路径：JCE 滚动窗口 → bkliveinfo 备用 | 有 | **保留，逻辑不变** |
+| 时移回看入口、限流退避、空闲静默 | 有 | **保留** |
+| 数据持久化目录 / 数据卷 | 需要 | **不需要**（无状态，只读文件系统） |
+| 访问口令 | 无 | **新增** `YSP_TOKEN`，所有地址带 `/<口令>/` 前缀 |
+| 反代 / 域名 / https 友好 | 仅读 Host | **新增** `YSP_PUBLIC_URL`，识别 `X-Forwarded-Proto/Host` |
+| 分片经 VPS 中转（可选） | 仅高码路径 | **新增**，低码路径也可选开启 `YSP_PROXY_SEGMENTS=1` |
+| 运行方式 | root | 非 root、`cap_drop: ALL`、`init: true`、HTTP/1.1 keep-alive、SIGTERM 优雅退出 |
+| 代码规模 | 约 3700 行 | 约 1700 行，纯标准库 |
 
----
-## ⚡ 一键部署（VPS Docker）
+> 本版本是使用者自行改造的衍生版，不是原作者发布的。原作者社区：https://t.me/garysclub　频道：https://t.me/garysclubchannel
+
+### ⚡ VPS 部署（Docker）
 
 ```bash
+# 一键部署
 curl -sSL https://raw.githubusercontent.com/sure155/ysptp-docker-v9.5/main/install.sh | bash
+
+# 或手动部署
+git clone https://github.com/sure155/ysptp-docker-v9.5.git /opt/ysp-live-lite
+cd /opt/ysp-live-lite
+docker compose up -d --build
 ```
 
-> 自动拉取代码、清理旧容器、构建镜像、启动服务。部署完成后输出订阅地址。
-
-## 🐳 Docker 版手动部署
-
-```bash
-git clone https://github.com/sure155/ysptp-docker-v9.5.git /opt/ysp-live-v9.5
-cd /opt/ysp-live-v9.5
-docker compose build --no-cache
-docker compose up -d
+容器启动后自动设置随机访问口令，订阅地址为：
+```
+http://<VPS_IP>:8767/<YSP_TOKEN>/all.m3u
 ```
 
-播放器订阅地址：`http://<IP>:8767/all.m3u`
+如需使用域名 + https（推荐），在 `.env` 里设 `HOST_BIND=127.0.0.1`、`YSP_PUBLIC_URL=https://tv.example.com`，然后用 Caddy/Nginx 反代即可。详见 README 顶部的环境变量说明。
 
----
-## 📱 订阅信息（VPS Docker 版）
+### 🐳 Docker Compose 配置
 
-| 用途 | 地址 |
-|------|------|
-| M3U 订阅 | `http://<IP>:8767/all.m3u` |
-| EPG 节目单 | `http://<IP>:8767/epg.xml` |
-| 健康检查 | `http://<IP>:8767/health` |
-| 诊断报告 | `http://<IP>:8767/diag` |
-
----
-## 🚀 常用命令（VPS Docker 版）
-
-```bash
-# 启动/更新
-cd /opt/ysp-live-v9.5 && docker compose up -d --build
-
-# 查看日志
-docker logs -f ysp-live-v9.5
-
-# 重启
-docker compose restart
-
-# 卸载
-docker compose down -v && cd /opt && rm -rf ysp-live-v9.5
+```yaml
+services:
+  ysp-live:
+    build: .
+    image: ysp-live-lite:1.0
+    container_name: ysp-live-lite
+    restart: unless-stopped
+    init: true            # SIGTERM 正常转发
+    ports:
+      - "${HOST_BIND:-0.0.0.0}:${HOST_PORT:-8767}:8767"
+    environment:
+      TZ: Asia/Shanghai
+      YSP_TOKEN: ${YSP_TOKEN:?请填写}
+      YSP_PUBLIC_URL: ${YSP_PUBLIC_URL:-}   # 域名反代时填 https://tv.example.com
+      YSP_PROXY_SEGMENTS: ${YSP_PROXY_SEGMENTS:-0}  # 1=分片经VPS中转（境外播放用）
+      YSP_CACHE_MB: ${YSP_CACHE_MB:-64}
+      YSP_EXCLUDE_CHANNELS: ${YSP_EXCLUDE_CHANNELS:-}
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    mem_limit: 384m
 ```
 
----
+### 🔧 环境变量
+
+| 变量 | 默认 | 说明 |
+|--|---|---|
+| `YSP_TOKEN` | *(必填)* | 访问口令，8~64 位。设置后地址形如 `/<口令>/all.m3u` |
+| `YSP_PUBLIC_URL` | 空 | 写进 m3u/m3u8 的基础地址；空则按请求 Host 自动生成 |
+| `YSP_PROXY_SEGMENTS` | `0` | `0`=播放器直连央视CDN（省流量）；`1`=分片经VPS中转（境外播放用） |
+| `YSP_CACHE_MB` | `64` | 中转模式的分片内存缓存（MB） |
+| `YSP_SEG_ALLOW_EXTRA` | 空 | 中转模式额外放行的 CDN 后缀 |
+| `YSP_EXCLUDE_CHANNELS` | 空 | 屏蔽频道，如 `cctv4k,cctv8k,cctv164k` |
+| `HOST_BIND` / `HOST_PORT` | `0.0.0.0` / `8767` | 宿主机映射（仅 docker-compose 生效） |
 ## ⚠️ 友情提醒
 
 1. **画质限制**：仅 1080P 低码（3~4Mbps），高码需设备注册，VPS/Worker 环境不具备（见开头说明）
