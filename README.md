@@ -22,7 +22,15 @@
 
 我对比过协议层：同样的随机种子和时间下，JCE 请求体、cKey 签名、bkliveinfo 请求、播放列表窗口解析与原版**逐字节一致**，没有改动低码率路径的任何请求方式。
 
-## 部署（3 步）
+## 部署（一行命令 / 3 步）
+
+### 一行命令（推荐，直接从 GitHub 执行）
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/sure155/ysptp-docker-v9.5/main/install.sh)
+```
+
+### 3 步手动部署
 
 ```bash
 # 1. 上传并解压到 VPS，进入目录
