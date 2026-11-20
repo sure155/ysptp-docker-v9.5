@@ -8,23 +8,29 @@
   * 保留：低码率路径（JCE 滚动窗口 → bkliveinfo 备用）、时移回看入口、限流退避、
           空闲停止后台轮询、换台不额外请求等原有调度
   * 新增：访问口令（路径前缀）、对外地址覆盖、可选分片中转、/healthz、优雅退出
+  * 优化（lite-1.3）：TS 分片中转 Keep-Alive 连接池、后台预加载、同分片合并回源
+                      边下边发、缓存 Range 支持、TCP_NODELAY 与上游断连自动重试
 
 纯 Python 标准库，无第三方依赖，无需持久化目录。
 
 环境变量：
-  YSP_TOKEN             访问口令（强烈建议设置，8~64 位 A-Za-z0-9_-）；设置后所有地址形如 /<TOKEN>/all.m3u
-  YSP_PUBLIC_URL        对外访问的基础地址，如 https://tv.example.com（反代 / 域名场景）
-  YSP_PROXY_SEGMENTS    1=分片经 VPS 中转（客户端无法直连 CDN / 需要 https 时用），默认 0=客户端直连 CDN
-  YSP_CACHE_MB          中转模式下的分片内存缓存，默认 64
-  YSP_SEG_ALLOW_EXTRA   中转模式额外允许的 CDN 域名后缀，逗号分隔，如 .foo.com,.bar.net
-  YSP_EXCLUDE_CHANNELS  不对外提供的频道 slug，逗号分隔，如 cctv4k,cctv8k,cctv164k
-  YSP_PORT / YSP_BIND   监听端口 / 地址（默认 8767 / 0.0.0.0；填 :: 则监听 IPv6 双栈）
+  YSP_TOKEN              访问口令（强烈建议设置，8~64 位 A-Za-z0-9_-）；设置后所有地址形如 /<TOKEN>/all.m3u
+  YSP_PUBLIC_URL         对外访问的基础地址，如 https://tv.example.com（反代 / 域名场景）
+  YSP_PROXY_SEGMENTS     1=分片经 VPS 中转（客户端无法直连 CDN / 需要 https 时用），默认 0=客户端直连 CDN
+  YSP_CACHE_MB           中转模式下的分片内存缓存，默认 64（建议中转模式设为 96~128）
+  YSP_PREFETCH_SEGMENTS  中转模式下后台预加载最新分片数，默认 3（0=关闭预加载，最大 8）
+  YSP_PREFETCH_WORKERS   中转模式下后台预加载并发线程数，默认 4（最大 12）
+  YSP_UPSTREAM_TIMEOUT   中转模式下上游分片请求超时秒数，默认 10（范围 3~30）
+  YSP_SEG_ALLOW_EXTRA    中转模式额外允许的 CDN 域名后缀，逗号分隔，如 .foo.com,.bar.net
+  YSP_EXCLUDE_CHANNELS   不对外提供的频道 slug，逗号分隔，如 cctv4k,cctv8k,cctv164k
+  YSP_PORT / YSP_BIND    监听端口 / 地址（默认 8767 / 0.0.0.0；填 :: 则监听 IPv6 双栈）
 """
 from __future__ import annotations
 
 import argparse
 import base64
 import collections
+import concurrent.futures
 import datetime
 import gzip
 import hmac
@@ -48,7 +54,7 @@ import uuid
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-__version__ = 'lite-1.2 (based on ysp-live 9.8)'
+__version__ = 'lite-1.3 (based on ysp-live 9.8)'
 AUTHOR_COMMUNITY = 'https://t.me/garysclub'
 AUTHOR_CHANNEL = 'https://t.me/garysclubchannel'
 
@@ -76,7 +82,10 @@ def _env_list(name: str) -> list:
 TOKEN = os.environ.get('YSP_TOKEN', '').strip()
 PUBLIC_URL = os.environ.get('YSP_PUBLIC_URL', '').strip().rstrip('/')
 PROXY_SEGMENTS = _env_bool('YSP_PROXY_SEGMENTS', False)
-CACHE_MB = _env_int('YSP_CACHE_MB', 64, 0, 2048)
+CACHE_MB = _env_int('YSP_CACHE_MB', 128, 0, 2048)
+PREFETCH_SEGMENTS = _env_int('YSP_PREFETCH_SEGMENTS', 3, 0, 8)
+PREFETCH_WORKERS = _env_int('YSP_PREFETCH_WORKERS', 4, 0, 12)
+SEG_UPSTREAM_TIMEOUT = _env_int('YSP_UPSTREAM_TIMEOUT', 10, 3, 30)
 SEG_ALLOW_EXTRA = tuple(s if s.startswith('.') else '.' + s for s in _env_list('YSP_SEG_ALLOW_EXTRA'))
 EXCLUDE_CHANNELS = set(_env_list('YSP_EXCLUDE_CHANNELS'))
 PRIMARY_MODE = os.environ.get('YSP_PRIMARY_MODE', 'bk').strip().lower()
@@ -762,16 +771,28 @@ class ApiFlowLimiter:
 global_flow_limiter = ApiFlowLimiter()
 
 class TsSegmentCache:
+    """线程安全的 O(1) LRU 分片内存缓存。"""
 
     def __init__(self, max_mb: int=100, max_age_sec: int=180):
         self.max_bytes = max_mb * 1024 * 1024
         self.max_age = max_age_sec
         self.lock = threading.Lock()
-        self.cache: dict[str, tuple[bytes, dict, float]] = {}
-        self.order = collections.deque()
+        self.cache: collections.OrderedDict[str, tuple[bytes, dict, float]] = collections.OrderedDict()
         self.curr_bytes = 0
         self.hits = 0
         self.misses = 0
+
+    def has(self, key: str) -> bool:
+        """供预加载器静默检查命中，不计入 hits/misses 统计。"""
+        with self.lock:
+            item = self.cache.get(key)
+            if not item:
+                return False
+            if time.time() > item[2]:
+                self.cache.pop(key, None)
+                self.curr_bytes -= len(item[0])
+                return False
+            return True
 
     def get(self, key: str) -> tuple[bytes, dict] | None:
         with self.lock:
@@ -782,35 +803,25 @@ class TsSegmentCache:
             data, headers, expire_at = item
             if time.time() > expire_at:
                 self.cache.pop(key, None)
-                try:
-                    self.order.remove(key)
-                except ValueError:
-                    pass
                 self.curr_bytes -= len(data)
                 self.misses += 1
                 return None
+            self.cache.move_to_end(key)
             self.hits += 1
             return (data, headers)
 
     def set(self, key: str, data: bytes, headers: dict):
+        if self.max_bytes <= 0 or len(data) > self.max_bytes:
+            return
         with self.lock:
-            if len(data) > self.max_bytes:
-                return
-            if key in self.cache:
-                old = self.cache.pop(key)
+            old = self.cache.pop(key, None)
+            if old:
                 self.curr_bytes -= len(old[0])
-                try:
-                    self.order.remove(key)
-                except ValueError:
-                    pass
             now = time.time()
-            while self.curr_bytes + len(data) > self.max_bytes and self.order:
-                old_key = self.order.popleft()
-                old_val = self.cache.pop(old_key, None)
-                if old_val:
-                    self.curr_bytes -= len(old_val[0])
+            while self.curr_bytes + len(data) > self.max_bytes and self.cache:
+                _, old_val = self.cache.popitem(last=False)
+                self.curr_bytes -= len(old_val[0])
             self.cache[key] = (data, headers, now + self.max_age)
-            self.order.append(key)
             self.curr_bytes += len(data)
 
     def stats(self) -> dict:
@@ -1194,13 +1205,17 @@ def refresh_loop(ch):
     fails = 0
     interval = _channel_refresh_interval(ch)
     if time.time() - ch.last_ok < interval:
-        build_playlist(ch, holdback=True)
+        pl = build_playlist(ch, holdback=True)
+        if pl and PROXY_SEGMENTS:
+            prefetch_playlist_segments(pl)
         ch.wake_event.wait(timeout=interval)
         ch.wake_event.clear()
     while time.time() - ch.last_access < LOW_STREAM_IDLE_TIMEOUT:
         ok = refresh_once(ch)
         if ok:
-            build_playlist(ch, holdback=True)
+            pl = build_playlist(ch, holdback=True)
+            if pl and PROXY_SEGMENTS:
+                prefetch_playlist_segments(pl)
         fails = 0 if ok else fails + 1
         interval = _channel_refresh_interval(ch)
         wait_sec = interval if fails < 3 else min(15.0, interval * 3.0)
@@ -1297,7 +1312,9 @@ def trigger_background_refresh(ch):
 
     def _do():
         if refresh_once(ch):
-            build_playlist(ch, holdback=True)
+            pl = build_playlist(ch, holdback=True)
+            if pl and PROXY_SEGMENTS:
+                prefetch_playlist_segments(pl)
     threading.Thread(target=coalesce_refresh, args=(ch.slug, _do), daemon=True).start()
 
 CHANNEL_MAP: dict[str, Channel] = {c[0]: Channel(*c) for c in DEFAULT_CHANNELS}
@@ -1368,7 +1385,7 @@ SEG_ALLOWED_SUFFIXES = (
 ) + SEG_ALLOW_EXTRA
 MAX_SEG_BYTES = 12 * 1024 * 1024
 _SEG_RE = re.compile(r'^/seg/([A-Za-z0-9_-]{8,6000})(?:\.\w{1,5})?$')
-_RANGE_RE = re.compile(r'^bytes=\d*-\d*$')
+_RANGE_RE = re.compile(r'^bytes=(\d*)-(\d*)$')
 _PASS_HEADERS = ('content-type', 'content-range', 'accept-ranges', 'content-length')
 _URI_ATTR = re.compile(r'URI="([^"]+)"')
 _SSL_CTX = ssl.create_default_context()
@@ -1413,37 +1430,353 @@ def proxify_playlist(text: str, prefix: str) -> str:
     return '\n'.join(out) + '\n'
 
 
-def open_upstream(url: str, range_header: str, head_only: bool):
-    """连接上游并返回 (conn, resp)。服务端跟随最多 3 次重定向，每一跳都重新校验域名白名单。"""
+def _set_tcp_nodelay(sock):
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+
+
+class UpstreamConnPool:
+    """线程安全的上游 HTTP/HTTPS Keep-Alive 连接池，消除每个 TS 分片重复 TCP/TLS 握手与慢启动。"""
+
+    def __init__(self, max_per_host: int = 8, max_total: int = 48, idle_ttl: float = 45.0):
+        self.max_per_host = max_per_host
+        self.max_total = max_total
+        self.idle_ttl = idle_ttl
+        self.lock = threading.Lock()
+        self.pools: dict[tuple[str, str, int], deque[tuple[http.client.HTTPConnection, float]]] = {}
+        self.total_idle = 0
+        self.reused = 0
+        self.created = 0
+
+    def acquire(self, scheme: str, host: str, port: int, timeout: float):
+        key = (scheme, host.lower(), port)
+        now = time.monotonic()
+        stale: list[http.client.HTTPConnection] = []
+        conn = None
+        with self.lock:
+            q = self.pools.get(key)
+            while q:
+                c, saved_at = q.pop()  # LIFO：优先复用最近刚活跃过的热连接
+                self.total_idle -= 1
+                if now - saved_at <= self.idle_ttl and c.sock is not None:
+                    conn = c
+                    self.reused += 1
+                    break
+                stale.append(c)
+            if q is not None and not q:
+                self.pools.pop(key, None)
+            if conn is None:
+                self.created += 1
+        for c in stale:
+            try:
+                c.close()
+            except Exception:
+                pass
+        if conn is not None:
+            conn.timeout = timeout
+            try:
+                if conn.sock is not None:
+                    conn.sock.settimeout(timeout)
+            except OSError:
+                pass
+            return conn, True
+        if scheme == 'https':
+            return http.client.HTTPSConnection(host, port, timeout=timeout, context=_SSL_CTX), False
+        return http.client.HTTPConnection(host, port, timeout=timeout), False
+
+    def release(self, key: tuple[str, str, int], conn: http.client.HTTPConnection, reusable: bool):
+        if not reusable or conn is None or conn.sock is None:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            return
+        now = time.monotonic()
+        evicted: list[http.client.HTTPConnection] = []
+        with self.lock:
+            q = self.pools.get(key)
+            if q is None:
+                q = deque()
+                self.pools[key] = q
+            q.append((conn, now))
+            self.total_idle += 1
+            while len(q) > self.max_per_host:
+                old_c, _ = q.popleft()
+                self.total_idle -= 1
+                evicted.append(old_c)
+            while self.total_idle > self.max_total and self.pools:
+                # 回收最老的空闲连接
+                oldest_key = None
+                oldest_ts = float('inf')
+                for k, dq in self.pools.items():
+                    if dq and dq[0][1] < oldest_ts:
+                        oldest_ts = dq[0][1]
+                        oldest_key = k
+                if oldest_key is None:
+                    break
+                old_c, _ = self.pools[oldest_key].popleft()
+                self.total_idle -= 1
+                if not self.pools[oldest_key]:
+                    self.pools.pop(oldest_key, None)
+                evicted.append(old_c)
+        for c in evicted:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    def close_all(self):
+        conns: list[http.client.HTTPConnection] = []
+        with self.lock:
+            for q in self.pools.values():
+                while q:
+                    c, _ = q.popleft()
+                    conns.append(c)
+            self.pools.clear()
+            self.total_idle = 0
+        for c in conns:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    def stats(self) -> dict:
+        with self.lock:
+            total = max(1, self.reused + self.created)
+            return {
+                'idle': self.total_idle,
+                'reused': self.reused,
+                'created': self.created,
+                'reuse_rate': f'{round(self.reused / total * 100, 1)}%',
+            }
+
+
+upstream_pool = UpstreamConnPool()
+
+
+def open_upstream(url: str, range_header: str, head_only: bool, timeout: float = SEG_UPSTREAM_TIMEOUT):
+    """通过 Keep-Alive 连接池连接上游并返回 (conn, resp, pool_key)。
+    支持最多 3 次白名单重定向，并对陈旧复用连接或瞬断自动重试 1 次。
+    """
+    method = 'HEAD' if head_only else 'GET'
     for _hop in range(4):
         p = urllib.parse.urlsplit(url)
-        https = p.scheme == 'https'
-        port = p.port or (443 if https else 80)
-        if https:
-            conn = http.client.HTTPSConnection(p.hostname, port, timeout=15, context=_SSL_CTX)
-        else:
-            conn = http.client.HTTPConnection(p.hostname, port, timeout=15)
-        try:
-            target = (p.path or '/') + ('?' + p.query if p.query else '')
-            headers = {'User-Agent': UA, 'Referer': 'https://live.cctv.cn/', 'Accept': '*/*', 'Accept-Encoding': 'identity', 'Connection': 'close'}
-            if range_header:
-                headers['Range'] = range_header
-            conn.request('HEAD' if head_only else 'GET', target, headers=headers)
-            resp = conn.getresponse()
-        except Exception:
-            conn.close()
-            raise
+        scheme = p.scheme.lower()
+        host = p.hostname or ''
+        port = p.port or (443 if scheme == 'https' else 80)
+        pool_key = (scheme, host.lower(), port)
+        target = (p.path or '/') + ('?' + p.query if p.query else '')
+        headers = {
+            'User-Agent': UA,
+            'Referer': 'https://live.cctv.cn/',
+            'Accept': '*/*',
+            'Accept-Encoding': 'identity',
+            'Connection': 'keep-alive',
+        }
+        if range_header:
+            headers['Range'] = range_header
+
+        conn = None
+        resp = None
+        last_exc = None
+        for attempt in range(2):
+            conn, reused = upstream_pool.acquire(scheme, host, port, timeout)
+            try:
+                conn.request(method, target, headers=headers)
+                _set_tcp_nodelay(conn.sock)
+                resp = conn.getresponse()
+                last_exc = None
+                break
+            except (http.client.HTTPException, OSError) as exc:
+                last_exc = exc
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+                resp = None
+                # 复用连接被对端提前关闭，或首次瞬断 -> 立即用新连接重试 1 次
+                if attempt == 0:
+                    continue
+                raise
+        if last_exc is not None or resp is None:
+            raise last_exc or RuntimeError('upstream request failed')
+
         if resp.status in (301, 302, 303, 307, 308):
             loc = resp.getheader('Location')
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
             if not loc:
                 raise RuntimeError('上游重定向缺少 Location')
             url = urllib.parse.urljoin(url, loc)
             if not seg_host_allowed(url):
                 raise PermissionError(urllib.parse.urlsplit(url).hostname or '?')
             continue
-        return conn, resp
+        return conn, resp, pool_key
     raise RuntimeError('上游重定向次数过多')
+
+
+class InFlightSegment:
+    """单个正在回源下载的分片：支持多请求合并回源 + 边下边发，完成后写入内存缓存。"""
+
+    def __init__(self, url: str):
+        self.url = url
+        self.cond = threading.Condition()
+        self.headers_ready = False
+        self.status = 0
+        self.headers: dict[str, str] = {}
+        self.expected_len: int | None = None
+        self.chunks: list[bytes] = []
+        self.total_bytes = 0
+        self.done = False
+        self.error: Exception | None = None
+        self.cacheable = True
+
+
+_inflight_seg_lock = threading.Lock()
+_inflight_segs: dict[str, InFlightSegment] = {}
+_prefetch_queued: set[str] = set()
+_proxy_stats_lock = threading.Lock()
+_proxy_stats = {'coalesced': 0, 'prefetched': 0, 'prefetch_errors': 0}
+_prefetch_executor: concurrent.futures.ThreadPoolExecutor | None = (
+    concurrent.futures.ThreadPoolExecutor(max_workers=PREFETCH_WORKERS, thread_name_prefix='ysp-prefetch')
+    if (PROXY_SEGMENTS and CACHE_MB > 0 and PREFETCH_SEGMENTS > 0 and PREFETCH_WORKERS > 0)
+    else None
+)
+
+
+def _download_segment(url: str, seg: InFlightSegment, is_prefetch: bool = False):
+    conn = None
+    pool_key = None
+    reusable = False
+    try:
+        conn, resp, pool_key = open_upstream(url, '', head_only=False)
+        hdrs = {k: v for k, v in resp.getheaders() if k.lower() in _PASS_HEADERS}
+        clen = resp.getheader('Content-Length')
+        expected = int(clen) if clen and clen.isdigit() else None
+        cacheable = resp.status == 200 and CACHE_MB > 0 and (expected is None or expected <= MAX_SEG_BYTES)
+        with seg.cond:
+            seg.status = resp.status
+            seg.headers = hdrs
+            seg.expected_len = expected
+            seg.cacheable = cacheable
+            seg.headers_ready = True
+            seg.cond.notify_all()
+
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            with seg.cond:
+                seg.chunks.append(chunk)
+                seg.total_bytes += len(chunk)
+                if seg.cacheable and seg.total_bytes > MAX_SEG_BYTES:
+                    seg.cacheable = False
+                seg.cond.notify_all()
+
+        if expected is not None and seg.total_bytes != expected:
+            with seg.cond:
+                seg.error = RuntimeError('upstream truncated (%d/%d)' % (seg.total_bytes, expected))
+            reusable = False
+        else:
+            reusable = not resp.will_close
+            if seg.cacheable and seg.chunks:
+                global_ts_cache.set(url, b''.join(seg.chunks), hdrs)
+                if is_prefetch:
+                    with _proxy_stats_lock:
+                        _proxy_stats['prefetched'] += 1
+    except Exception as exc:
+        reusable = False
+        with seg.cond:
+            seg.error = exc
+        if is_prefetch:
+            with _proxy_stats_lock:
+                _proxy_stats['prefetch_errors'] += 1
+        else:
+            log('[中转] 上游拉取分片失败: %s: %s' % (type(exc).__name__, exc), min_interval=10.0)
+    finally:
+        if conn is not None and pool_key is not None:
+            upstream_pool.release(pool_key, conn, reusable)
+        elif conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        with _inflight_seg_lock:
+            if _inflight_segs.get(url) is seg:
+                _inflight_segs.pop(url, None)
+        with seg.cond:
+            seg.headers_ready = True
+            seg.done = True
+            seg.cond.notify_all()
+
+
+def _prefetch_one(url: str):
+    with _inflight_seg_lock:
+        _prefetch_queued.discard(url)
+        if global_ts_cache.has(url) or url in _inflight_segs:
+            return
+        seg = InFlightSegment(url)
+        _inflight_segs[url] = seg
+    _download_segment(url, seg, is_prefetch=True)
+
+
+def prefetch_playlist_segments(pl_text: str):
+    """对直播播放列表尾部最新 N 个 TS 分片发起后台预加载（跳过时移/点播列表）。"""
+    if _prefetch_executor is None or not pl_text or '#EXT-X-ENDLIST' in pl_text:
+        return
+    urls = [
+        ln.strip() for ln in pl_text.splitlines()
+        if ln.strip() and not ln.strip().startswith('#')
+        and ln.strip().startswith(('http://', 'https://'))
+        and seg_host_allowed(ln.strip())
+    ]
+    if not urls:
+        return
+    targets = urls[-PREFETCH_SEGMENTS:]
+    for u in targets:
+        if global_ts_cache.has(u):
+            continue
+        with _inflight_seg_lock:
+            if u in _inflight_segs or u in _prefetch_queued:
+                continue
+            _prefetch_queued.add(u)
+        try:
+            _prefetch_executor.submit(_prefetch_one, u)
+        except RuntimeError:
+            with _inflight_seg_lock:
+                _prefetch_queued.discard(u)
+            break
+
+
+def _parse_byte_range(range_header: str, total_len: int) -> tuple[int, int] | None:
+    """解析标准单区间 Range 头；无效或越界返回 None。"""
+    m = _RANGE_RE.match(range_header)
+    if not m or total_len <= 0:
+        return None
+    s_str, e_str = m.group(1), m.group(2)
+    if not s_str and not e_str:
+        return None
+    if not s_str:
+        suffix = int(e_str)
+        if suffix <= 0:
+            return None
+        start = max(0, total_len - suffix)
+        end = total_len - 1
+    else:
+        start = int(s_str)
+        end = int(e_str) if e_str else (total_len - 1)
+        if start >= total_len or end < start:
+            return None
+        end = min(end, total_len - 1)
+    return (start, end)
 
 
 # ===================== HTTP 服务 =====================
@@ -1451,6 +1784,10 @@ class Handler(BaseHTTPRequestHandler):
     server_version = 'ysp-live-lite'
     protocol_version = 'HTTP/1.1'
     timeout = 60  # 客户端空闲 / 写入卡住 60 秒后释放线程
+
+    def setup(self):
+        super().setup()
+        _set_tcp_nodelay(self.connection)
 
     def version_string(self):
         return self.server_version
@@ -1477,8 +1814,10 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, socket.timeout):
             self.close_connection = True
 
-    def _send_playlist(self, text, head_only, extra=None):
+    def _send_playlist(self, text, head_only, extra=None, prefetch=True):
         if PROXY_SEGMENTS:
+            if prefetch and not head_only:
+                prefetch_playlist_segments(text)
             text = proxify_playlist(text, public_root(self.headers) + '/seg/')
         self._send(200, text, 'application/vnd.apple.mpegurl', head_only=head_only, extra_headers=extra)
 
@@ -1567,6 +1906,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _health(self, head_only):
         gate = jce_request_gate.remaining()
+        with _proxy_stats_lock:
+            pstats = dict(_proxy_stats)
         data = {
             'ok': True,
             'version': __version__,
@@ -1578,6 +1919,13 @@ class Handler(BaseHTTPRequestHandler):
             'jce_cooldown_sec': int(math.ceil(gate)) if gate > 0 else 0,
             'ts_cache': global_ts_cache.stats(),
         }
+        if PROXY_SEGMENTS:
+            data['ts_proxy'] = {
+                'conn_pool': upstream_pool.stats(),
+                'prefetch_segments': PREFETCH_SEGMENTS,
+                'prefetch_workers': PREFETCH_WORKERS,
+                **pstats,
+            }
         self._send(200, json.dumps(data, ensure_ascii=False, indent=2), 'application/json; charset=utf-8', head_only=head_only)
 
     def _diag(self, head_only):
@@ -1594,8 +1942,15 @@ class Handler(BaseHTTPRequestHandler):
         ]
         if PROXY_SEGMENTS:
             c = global_ts_cache.stats()
+            p = upstream_pool.stats()
+            with _proxy_stats_lock:
+                ps = dict(_proxy_stats)
             info.append('分片内存缓存: 条目=%s, 占用=%sMB, 命中率=%s (命中:%s/未中:%s)' % (
                 c['count'], c['size_mb'], c['hit_rate'], c['hits'], c['misses']))
+            info.append('上游连接池: 空闲=%s, 复用=%s, 新建=%s, 复用率=%s' % (
+                p['idle'], p['reused'], p['created'], p['reuse_rate']))
+            info.append('预加载与合并: 预加载数=%d/并发=%d, 已预载=%d, 合并回源=%d, 预载失败=%d' % (
+                PREFETCH_SEGMENTS, PREFETCH_WORKERS, ps['prefetched'], ps['coalesced'], ps['prefetch_errors']))
         info.append('--- 频道状态列表 ---')
         for meta in global_channel_dir.unique_channels():
             ch = CHANNEL_MAP.get(meta['slug'])
@@ -1621,7 +1976,7 @@ class Handler(BaseHTTPRequestHandler):
             start_ts, end_ts = catchup
             try:
                 m3u8_url = jce_timeshift_url(ch.pid, ch.sid, start_ts, end_ts, ch.defn)
-                return self._send_playlist(fetch_abs_playlist(m3u8_url), head_only)
+                return self._send_playlist(fetch_abs_playlist(m3u8_url), head_only, prefetch=False)
             except Exception as e:
                 log('[%s] 时移获取失败: %s，回退直播' % (canonical, e), min_interval=10.0)
 
@@ -1658,6 +2013,50 @@ class Handler(BaseHTTPRequestHandler):
         self._send(503, '频道 %s 暂无数据 (%s), 请稍后重试\n' % (ch.name, ch.last_error or '拉取中'), head_only=head_only)
 
     # ---- 分片中转 ----
+    def _send_cached_segment(self, data: bytes, hdrs: dict, range_header: str, head_only: bool):
+        total = len(data)
+        if range_header:
+            br = _parse_byte_range(range_header, total)
+            if br is None:
+                self.send_response(416)
+                self.send_header('Content-Range', 'bytes */%d' % total)
+                self.send_header('Content-Length', '0')
+                self.send_header('Access-Control-Allow-Origin', '*')
+                self.end_headers()
+                self._started = True
+                return
+            start, end = br
+            part = data[start:end + 1]
+            self.send_response(206)
+            for k, v in hdrs.items():
+                if k.lower() not in ('content-length', 'content-range', 'accept-ranges'):
+                    self.send_header(k, v)
+            self.send_header('Accept-Ranges', 'bytes')
+            self.send_header('Content-Range', 'bytes %d-%d/%d' % (start, end, total))
+            self.send_header('Content-Length', str(len(part)))
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Cache-Control', 'public, max-age=60')
+            self.send_header('X-Cache', 'HIT')
+            self.end_headers()
+            self._started = True
+            if not head_only:
+                self.wfile.write(part)
+            return
+
+        self.send_response(200)
+        for k, v in hdrs.items():
+            if k.lower() not in ('content-length', 'accept-ranges'):
+                self.send_header(k, v)
+        self.send_header('Accept-Ranges', 'bytes')
+        self.send_header('Content-Length', str(total))
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Cache-Control', 'public, max-age=60')
+        self.send_header('X-Cache', 'HIT')
+        self.end_headers()
+        self._started = True
+        if not head_only:
+            self.wfile.write(data)
+
     def _serve_segment(self, token, head_only):
         try:
             real_url = _b64d(token)
@@ -1672,27 +2071,98 @@ class Handler(BaseHTTPRequestHandler):
         if not _RANGE_RE.match(range_header):
             range_header = ''
 
-        if not range_header and not head_only:
-            hit = global_ts_cache.get(real_url)
-            if hit is not None:
-                data, hdrs = hit
-                self.send_response(200)
-                for k, v in hdrs.items():
-                    if k.lower() != 'content-length':
-                        self.send_header(k, v)
-                self.send_header('Content-Length', str(len(data)))
-                self.send_header('Access-Control-Allow-Origin', '*')
-                self.send_header('Cache-Control', 'public, max-age=60')
-                self.send_header('X-Cache', 'HIT')
-                self.end_headers()
-                self._started = True
-                self.wfile.write(data)
-                return
+        # 1. 优先命中内存缓存（同时支持普通 GET / HEAD / Range 请求）
+        hit = global_ts_cache.get(real_url)
+        if hit is not None:
+            data, hdrs = hit
+            self._send_cached_segment(data, hdrs, range_header, head_only)
+            return
 
+        # 2. 普通 GET 请求：走合并回源 + 边下边发，避免与预加载/多端重复回源
+        if not range_header and not head_only:
+            seg = None
+            coalesced = False
+            with _inflight_seg_lock:
+                # 二次检查缓存，防止刚完成回源的竞态
+                hit = global_ts_cache.get(real_url)
+                if hit is not None:
+                    data, hdrs = hit
+                else:
+                    seg = _inflight_segs.get(real_url)
+                    if seg is not None:
+                        coalesced = True
+                    else:
+                        seg = InFlightSegment(real_url)
+                        _inflight_segs[real_url] = seg
+            if hit is not None:
+                self._send_cached_segment(data, hdrs, '', False)
+                return
+            if coalesced:
+                with _proxy_stats_lock:
+                    _proxy_stats['coalesced'] += 1
+            else:
+                threading.Thread(target=_download_segment, args=(real_url, seg, False), daemon=True).start()
+
+            # 等待上游响应头就绪
+            deadline = time.monotonic() + SEG_UPSTREAM_TIMEOUT + 5.0
+            with seg.cond:
+                while not seg.headers_ready:
+                    rem = deadline - time.monotonic()
+                    if rem <= 0:
+                        break
+                    seg.cond.wait(timeout=rem)
+                if not seg.headers_ready or (seg.error is not None and seg.status == 0):
+                    err = seg.error
+                    if isinstance(err, PermissionError):
+                        log('[中转] 重定向到非白名单域名被拒绝: %s' % err, min_interval=30.0)
+                        return self._send(403, 'forbidden redirect\n', head_only=False)
+                    return self._send(502, 'upstream error\n', head_only=False)
+                status = seg.status
+                hdrs = dict(seg.headers)
+                expected = seg.expected_len
+
+            self.send_response(status)
+            for k, v in hdrs.items():
+                self.send_header(k, v)
+            self.send_header('Access-Control-Allow-Origin', '*')
+            self.send_header('Cache-Control', 'public, max-age=60')
+            self.send_header('X-Cache', 'COALESCE' if coalesced else 'MISS')
+            if expected is None:
+                self.send_header('Connection', 'close')
+                self.close_connection = True
+            self.end_headers()
+            self._started = True
+
+            idx = 0
+            sent = 0
+            while True:
+                with seg.cond:
+                    while idx >= len(seg.chunks) and not seg.done:
+                        if not seg.cond.wait(timeout=SEG_UPSTREAM_TIMEOUT + 5.0):
+                            break
+                    new_chunks = seg.chunks[idx:]
+                    idx += len(new_chunks)
+                    done = seg.done
+                    err = seg.error
+                for ch_bytes in new_chunks:
+                    self.wfile.write(ch_bytes)
+                    sent += len(ch_bytes)
+                if done:
+                    if err is not None or (expected is not None and sent != expected):
+                        self.close_connection = True
+                    break
+                if not new_chunks:
+                    self.close_connection = True
+                    break
+            return
+
+        # 3. 未命中缓存的 Range / HEAD 请求：直接走 Keep-Alive 连接池透传
         conn = None
+        pool_key = None
+        reusable = False
         try:
             try:
-                conn, resp = open_upstream(real_url, range_header, head_only)
+                conn, resp, pool_key = open_upstream(real_url, range_header, head_only)
             except PermissionError as e:
                 log('[中转] 重定向到非白名单域名被拒绝: %s' % e, min_interval=30.0)
                 return self._send(403, 'forbidden redirect\n', head_only=head_only)
@@ -1715,10 +2185,10 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self._started = True
             if head_only:
+                resp.read()
+                reusable = not resp.will_close
                 return
 
-            cacheable = resp.status == 200 and not range_header and (expected is None or expected <= MAX_SEG_BYTES)
-            buf = bytearray()
             sent = 0
             while True:
                 chunk = resp.read(65536)
@@ -1726,23 +2196,22 @@ class Handler(BaseHTTPRequestHandler):
                     break
                 self.wfile.write(chunk)
                 sent += len(chunk)
-                if cacheable:
-                    if len(buf) + len(chunk) > MAX_SEG_BYTES:
-                        cacheable = False
-                        buf = bytearray()
-                    else:
-                        buf.extend(chunk)
             if expected is not None and sent != expected:
                 self.close_connection = True  # 上游提前断流：别让客户端在这条连接上傻等
-            elif cacheable and buf:
-                global_ts_cache.set(real_url, bytes(buf), hdrs)
+                reusable = False
+            else:
+                reusable = not resp.will_close
         except (BrokenPipeError, ConnectionResetError, socket.timeout):
             self.close_connection = True
+            reusable = False
         except (http.client.HTTPException, OSError) as e:
             self.close_connection = True
+            reusable = False
             log('[中转] 分片传输中断: %s: %s' % (type(e).__name__, e), min_interval=10.0)
         finally:
-            if conn is not None:
+            if conn is not None and pool_key is not None:
+                upstream_pool.release(pool_key, conn, reusable)
+            elif conn is not None:
                 conn.close()
 
 
@@ -1786,8 +2255,11 @@ def main():
     log('=' * 68)
     log('ysp-live-lite %s 启动成功: %d 个频道 (央视 %d 路, 卫视 %d 路) · 低码率路径 (主通道: %s，失败自动切换备用)' % (
         __version__, total, cctv, total - cctv, PRIMARY_MODE))
-    log('监听 %s:%d · 分片模式: %s · 缓存 %dMB' % (
-        args.bind, args.port, 'VPS 中转' if PROXY_SEGMENTS else '客户端直连 CDN', CACHE_MB if PROXY_SEGMENTS else 0))
+    if PROXY_SEGMENTS:
+        log('监听 %s:%d · 分片模式: VPS 中转 · 缓存 %dMB · 预加载 %d 片/%d 并发 · 上游超时 %ds' % (
+            args.bind, args.port, CACHE_MB, PREFETCH_SEGMENTS, PREFETCH_WORKERS, SEG_UPSTREAM_TIMEOUT))
+    else:
+        log('监听 %s:%d · 分片模式: 客户端直连 CDN' % (args.bind, args.port))
     log('订阅地址: %s/all.m3u' % ('http://<你的地址>:%d/<YSP_TOKEN>' % args.port if TOKEN else 'http://<你的地址>:%d' % args.port))
     if EXCLUDE_CHANNELS:
         log('已按 YSP_EXCLUDE_CHANNELS 屏蔽频道: %s' % ','.join(sorted(EXCLUDE_CHANNELS)))
@@ -1799,6 +2271,9 @@ def main():
         srv.serve_forever()
     finally:
         srv.server_close()
+        upstream_pool.close_all()
+        if _prefetch_executor is not None:
+            _prefetch_executor.shutdown(wait=False)
         log('[系统] 服务已停止')
 
 
