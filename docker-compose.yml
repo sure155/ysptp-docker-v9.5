@@ -1,10 +1,15 @@
+
+
+
+YML 图标
+docker-compose
 services:
   ysp-live:
     build:
       context: .
       args:
         PY_IMAGE: ${PY_IMAGE:-python:3.12-slim}
-    image: ysp-live-lite:1.2
+    image: ysp-live-lite:1.3
     container_name: ysp-live-lite
     restart: unless-stopped
     init: true            # 让 SIGTERM 正确转发，docker stop 秒退
@@ -15,8 +20,11 @@ services:
       TZ: Asia/Shanghai
       YSP_TOKEN: ${YSP_TOKEN:?请先 cp .env.example .env，并把 YSP_TOKEN 设置为随机串（openssl rand -hex 16）}
       YSP_PUBLIC_URL: ${YSP_PUBLIC_URL:-}
-      YSP_PROXY_SEGMENTS: ${YSP_PROXY_SEGMENTS:-0}
-      YSP_CACHE_MB: ${YSP_CACHE_MB:-64}
+      YSP_PROXY_SEGMENTS: ${YSP_PROXY_SEGMENTS:-1}
+      YSP_CACHE_MB: ${YSP_CACHE_MB:-128}
+      YSP_PREFETCH_SEGMENTS: ${YSP_PREFETCH_SEGMENTS:-3}
+      YSP_PREFETCH_WORKERS: ${YSP_PREFETCH_WORKERS:-4}
+      YSP_UPSTREAM_TIMEOUT: ${YSP_UPSTREAM_TIMEOUT:-10}
       YSP_PRIMARY_MODE: ${YSP_PRIMARY_MODE:-bk}
       YSP_FORCE_IPV4: ${YSP_FORCE_IPV4:-0}
       YSP_UPSTREAM_PROXY: ${YSP_UPSTREAM_PROXY:-}
