@@ -87,15 +87,19 @@ else
     sed -i "s/^YSP_PROXY_SEGMENTS=.*/YSP_PROXY_SEGMENTS=0/" .env
 fi
 
-# 4. 构建并启动容器
+# 4. 清理旧容器（如有）
+echo_info "检查并清理旧容器..."
+docker rm -f ysp-live-lite 2>/dev/null && echo_info "已移除旧容器" || true
+
+# 5. 构建并启动容器
 echo_info "构建并启动容器..."
 docker compose up -d --build
 
-# 5. 等待容器启动
+# 6. 等待容器启动
 echo_info "等待容器启动..."
 sleep 5
 
-# 6. 检查容器状态
+# 7. 检查容器状态
 if docker ps | grep -q ysp-live-lite; then
     echo_info "容器启动成功!"
     echo_info "订阅地址: http://$(hostname -I | awk '{print $1}'):8767/$TOKEN/all.m3u"
@@ -110,7 +114,7 @@ else
     exit 1
 fi
 
-# 7. 可选：配置防火墙
+# 8. 可选：配置防火墙
 echo_info "配置防火墙..."
 if command -v ufw &> /dev/null; then
     ufw allow 8767/tcp

@@ -1,8 +1,3 @@
-
-
-
-YML 图标
-docker-compose
 services:
   ysp-live:
     build:
