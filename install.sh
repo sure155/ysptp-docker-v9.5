@@ -50,12 +50,8 @@ fi
 
 # 2. 拉取代码
 echo_info "拉取 ysp-live-lite 代码..."
-if [ ! -d "ysp-live-lite" ]; then
-    git clone https://github.com/sure155/ysptp-docker-v9.5.git ysp-live-lite
-else
-    cd ysp-live-lite
-    git pull
-fi
+rm -rf ysp-live-lite
+git clone https://github.com/sure155/ysptp-docker-v9.5.git ysp-live-lite
 cd ysp-live-lite
 
 # 3. 生成配置
