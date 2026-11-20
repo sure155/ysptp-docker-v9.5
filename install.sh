@@ -70,6 +70,23 @@ sed -i "s/^YSP_TOKEN=.*/YSP_TOKEN=$TOKEN/" .env
 
 echo_info "生成的访问口令: $TOKEN"
 
+# --- 新增：YSP_PROXY_SEGMENTS 设置 ---
+echo_info "是否启用 TS 分片代理模式?"
+echo_info "  0 (默认)：播放器直接向央视 CDN 取分片。VPS 只做播放列表，几乎不耗流量"
+echo_info "  1：分片全部经 VPS 转发（带内存缓存，多人看同一频道只回源一次）。适合：播放设备在境外或直连央视 CDN 被拒、需要 https、或分片地址与 VPS IP 绑定"
+read -p "请输入选项 [默认 0]: " PROXY_SEG_CHOICE
+PROXY_SEG_CHOICE=${PROXY_SEG_CHOICE:-0}
+if [ "$PROXY_SEG_CHOICE" = "1" ]; then
+    sed -i "s/^YSP_PROXY_SEGMENTS=.*/YSP_PROXY_SEGMENTS=1/" .env
+    echo_info "已启用 TS 分片代理模式 (YSP_PROXY_SEGMENTS=1)"
+elif [ "$PROXY_SEG_CHOICE" = "0" ]; then
+    sed -i "s/^YSP_PROXY_SEGMENTS=.*/YSP_PROXY_SEGMENTS=0/" .env
+    echo_info "保持默认直连模式 (YSP_PROXY_SEGMENTS=0)"
+else
+    echo_warn "无效选项，保持默认直连模式 (YSP_PROXY_SEGMENTS=0)"
+    sed -i "s/^YSP_PROXY_SEGMENTS=.*/YSP_PROXY_SEGMENTS=0/" .env
+fi
+
 # 4. 构建并启动容器
 echo_info "构建并启动容器..."
 docker compose up -d --build
